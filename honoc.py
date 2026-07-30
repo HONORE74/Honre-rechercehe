@@ -1,93 +1,266 @@
-def graphique_relation_reelle(results, x_col="y_pred", strates=None):
-    """Reproduit le style des graphiques de reference : axe X = une VRAIE variable
-    continue (pas un simple rang trie), sans aucun logarithme."""
-    if strates is None:
-        p50, p90, p99 = np.percentile(results["y_obs"], [50, 90, 99])
-        strates = [(-np.inf, p50, "P0-50"), (p50, p90, "P50-90"),
-                  (p90, p99, "P90-99"), (p99, np.inf, "P99+")]
+# Priorisation des anomalies détectées par Conformal Prediction
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    axes = axes.flatten()
+## Objectif
 
-    for ax, (lo, hi, label) in zip(axes, strates):
-        sous = results[(results["y_obs"] >= lo) & (results["y_obs"] < hi)].sort_values(x_col)
-        if len(sous) == 0:
-            ax.set_visible(False); continue
-        x = sous[x_col].values                       # 🔴 vraie variable, plus un simple rang
-        ok = sous["dans_intervalle"]
+La méthode de **Split Conformal Prediction** permet de détecter les observations dont la valeur observée se situe en dehors de l'intervalle de prédiction conforme.
 
-        ax.fill_between(x, sous["borne_basse"], sous["borne_haute"],
-                        color="mediumseagreen", alpha=0.25, label="Intervalle conforme (90%)")
-        ax.scatter(x[ok],  sous.loc[ok,"y_obs"],  s=10, color="darkgreen", alpha=0.4,
-                  label="Observation (dans l'intervalle)")
-        ax.scatter(x[~ok], sous.loc[~ok,"y_obs"], s=28, color="red", zorder=5,
-                  label=f"Anomalie (n={(~ok).sum()})")
-        ax.plot(x, sous["y_pred"], color="darkgreen", lw=1.2, alpha=0.6, label="Prediction")
+Une observation est considérée comme anormale lorsque
 
-        ax.set_title(f"Strate {label}  (n={len(sous):,})")
-        ax.set_xlabel(x_col); ax.set_ylabel(f"{TARGET} (EUR)")
-        ax.legend(fontsize=8, loc="upper left")
+$$
+y_i^{obs} \notin [L_i,U_i]
+$$
 
-    plt.tight_layout(); plt.savefig("relation_reelle.png", dpi=200); plt.show()
+où :
 
-graphique_relation_reelle(results_test, x_col="RBNS_bop")
+- $y_i^{obs}$ est la valeur observée ;
+- $L_i$ est la borne inférieure de l'intervalle conforme ;
+- $U_i$ est la borne supérieure.
 
+Cependant, toutes les anomalies n'ont pas la même importance. Une légère sortie de l'intervalle sur un portefeuille de faible montant n'a pas le même impact qu'une anomalie importante sur un portefeuille représentant plusieurs centaines de millions d'euros.
 
+L'objectif est donc de construire un **score de priorisation** permettant de classer automatiquement les anomalies de la plus critique à la moins critique.
 
+---
 
+# Proposition 1 : Priorisation à partir de la borne conforme
 
+## Principe
 
+L'idée consiste à mesurer **à quel point l'observation dépasse la limite acceptable définie par la Conformal Prediction**.
 
+Lorsque l'observation dépasse la borne supérieure :
 
+$$
+A_i=\frac{y_i^{obs}-U_i}{U_i}
+$$
 
+Lorsque l'observation est inférieure à la borne basse :
 
+$$
+A_i=\frac{L_i-y_i^{obs}}{L_i}
+$$
 
+Une écriture unique peut être utilisée :
 
-import numpy as np
-import matplotlib.pyplot as plt
+$$
+A_i=
+\frac{\min\left(|y_i^{obs}-L_i|,\;|y_i^{obs}-U_i|\right)}
+{\text{borne franchie}}
+$$
 
-def graphique_relation_reelle(results, x_col="RBNS_bop", strates=None):
-    """Observations dans l'intervalle en BLEU, anomalies (hors intervalle) en ROUGE.
-    Contenu centre dans chaque repere via des marges calculees sur les donnees.
-    Aucun logarithme."""
-    if strates is None:
-        p50, p90, p99 = np.percentile(results["y_obs"], [50, 90, 99])
-        strates = [(-np.inf, p50, "P0-50"), (p50, p90, "P50-90"),
-                  (p90, p99, "P90-99"), (p99, np.inf, "P99+")]
+Ce score représente le dépassement relatif de la frontière conforme.
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    axes = axes.flatten()
+Plus cette valeur est grande, plus l'observation est éloignée de la zone considérée comme normale.
 
-    for ax, (lo, hi, label) in zip(axes, strates):
-        sous = results[(results["y_obs"] >= lo) & (results["y_obs"] < hi)].sort_values(x_col)
-        if len(sous) == 0:
-            ax.set_visible(False); continue
-        x = sous[x_col].values
-        ok = sous["dans_intervalle"]
+---
 
-        ax.fill_between(x, sous["borne_basse"], sous["borne_haute"],
-                        color="lightsteelblue", alpha=0.35, label="Intervalle conforme (90%)")
-        ax.plot(x, sous["y_pred"], color="steelblue", lw=1.3, alpha=0.8, label="Prediction")
+## Pourquoi diviser par la borne ?
 
-        # 🔵 observations DANS l'intervalle -> BLEU
-        ax.scatter(x[ok], sous.loc[ok, "y_obs"], s=14, color="royalblue", alpha=0.55,
-                  edgecolor="none", label="Observation (dans l'intervalle)")
-        # 🔴 anomalies HORS intervalle -> ROUGE, au premier plan
-        ax.scatter(x[~ok], sous.loc[~ok, "y_obs"], s=32, color="red", zorder=5,
-                  edgecolor="darkred", linewidth=0.4, label=f"Anomalie (n={(~ok).sum()})")
+L'utilisation de
 
-        # --- Centrage du contenu dans le repere (evite le contenu ecrase dans un coin) ---
-        all_y = np.concatenate([sous["y_obs"].values, sous["borne_basse"].values,
-                                sous["borne_haute"].values])
-        y_lo, y_hi = np.percentile(all_y, [1, 99])
-        marge_y = (y_hi - y_lo) * 0.12
-        ax.set_ylim(max(0, y_lo - marge_y), y_hi + marge_y)
-        ax.margins(x=0.04)
+$$
+y_i^{obs}-U_i
+$$
 
-        ax.set_title(f"Strate {label}  (n={len(sous):,})")
-        ax.set_xlabel(x_col); ax.set_ylabel(f"{TARGET} (EUR)")
-        ax.legend(fontsize=8, loc="upper left")
+ne permet pas de comparer des portefeuilles ayant des ordres de grandeur très différents.
 
-    plt.tight_layout(); plt.savefig("relation_reelle.png", dpi=200); plt.show()
+Par exemple :
 
-graphique_relation_reelle(results_test, x_col="RBNS_bop")
+- un dépassement de 100 € sur un portefeuille de 1 000 € représente 10 % ;
+- un dépassement de 100 € sur un portefeuille de 100 M€ est quasiment négligeable.
+
+En normalisant par la borne conforme,
+
+$$
+\frac{y_i^{obs}-U_i}{U_i},
+$$
+
+on obtient un indicateur indépendant de l'échelle des données.
+
+Toutes les anomalies deviennent ainsi comparables entre elles.
+
+---
+
+# Pondération par la taille économique du portefeuille
+
+Une anomalie statistique importante n'est pas forcément prioritaire si elle concerne un portefeuille très peu exposé.
+
+Inversement, une anomalie relativement faible peut devenir critique lorsqu'elle concerne un portefeuille représentant une exposition financière importante.
+
+Pour intégrer cette information métier, le score précédent est pondéré par la **Gross Written Premium (GWP)**.
+
+Le score devient
+
+$$
+Score_i=A_i\times GWP_i
+$$
+
+c'est-à-dire
+
+$$
+Score_i=
+\left(
+\frac{|y_i^{obs}-\text{borne}|}
+{\text{borne}}
+\right)
+\times GWP_i.
+$$
+
+Les anomalies sont ensuite classées par ordre décroissant de ce score.
+
+Cette approche permet de privilégier les anomalies ayant simultanément :
+
+- un fort dépassement de la borne conforme ;
+- un impact économique important.
+
+---
+
+# Proposition 2 : Priorisation à partir de l'erreur du modèle
+
+## Principe
+
+Une seconde possibilité consiste à utiliser directement la prédiction du modèle au lieu de la borne conforme.
+
+On calcule alors l'erreur relative :
+
+$$
+B_i=
+\frac{|y_i^{obs}-\hat y_i|}
+{\hat y_i}
+$$
+
+où
+
+- $\hat y_i$ désigne la prédiction du modèle.
+
+Cette quantité mesure l'écart relatif entre la valeur réellement observée et la valeur attendue par le modèle.
+
+Plus cette erreur est importante, plus le comportement observé est inhabituel.
+
+---
+
+# Pondération par la GWP
+
+Comme précédemment, on intègre l'importance économique du portefeuille.
+
+Le score devient
+
+$$
+Score_i=
+\frac{|y_i^{obs}-\hat y_i|}
+{\hat y_i}
+\times GWP_i.
+$$
+
+Les observations sont ensuite triées par ordre décroissant.
+
+---
+
+# Différence entre les deux approches
+
+La première approche mesure :
+
+> **À quel point l'observation dépasse la limite définie par la Conformal Prediction.**
+
+La seconde mesure :
+
+> **À quel point le modèle s'est trompé sur cette observation.**
+
+Ces deux informations sont complémentaires.
+
+Une observation peut être :
+
+- très éloignée de la prédiction du modèle,
+- tout en restant à l'intérieur de l'intervalle conforme.
+
+À l'inverse,
+
+une observation peut sortir légèrement de l'intervalle conforme tout en restant relativement proche de la prédiction.
+
+Les deux approches permettent donc de capturer des aspects différents de l'anomalie.
+
+---
+
+# Proposition d'amélioration
+
+Une approche plus complète consiste à combiner simultanément :
+
+- la gravité statistique de l'anomalie ;
+- la qualité de la prédiction du modèle ;
+- l'importance économique du portefeuille.
+
+On peut définir le score suivant :
+
+$$
+Score_i=
+\left(
+\frac{|y_i^{obs}-\hat y_i|}
+{\hat y_i}
+\right)
+\times
+\left(
+\frac{|y_i^{obs}-\text{borne}|}
+{\text{borne}}
+\right)
+\times
+GWP_i.
+$$
+
+Une anomalie sera alors considérée comme prioritaire lorsqu'elle vérifie simultanément les trois propriétés suivantes :
+
+- elle est très éloignée de la prédiction du modèle ;
+- elle dépasse largement l'intervalle conforme ;
+- elle concerne un portefeuille présentant une exposition financière importante.
+
+Cette approche fournit un classement des anomalies beaucoup plus proche des besoins opérationnels des équipes actuarielles.
+
+---
+
+# Perspectives d'amélioration
+
+L'utilisation directe de la **Gross Written Premium (GWP)** peut conduire à favoriser systématiquement les plus grands portefeuilles.
+
+Une amélioration possible consiste à remplacer la GWP par une version normalisée.
+
+Par exemple,
+
+$$
+GWP_i^{*}=\log(1+GWP_i)
+$$
+
+ou
+
+$$
+GWP_i^{*}=\frac{GWP_i}{\max(GWP)}.
+$$
+
+Le score devient alors
+
+$$
+Score_i=
+\left(
+\frac{|y_i^{obs}-\text{borne}|}
+{\text{borne}}
+\right)
+\times
+\log(1+GWP_i)
+$$
+
+ou
+
+$$
+Score_i=
+\left(
+\frac{|y_i^{obs}-\hat y_i|}
+{\hat y_i}
+\right)
+\times
+\left(
+\frac{|y_i^{obs}-\text{borne}|}
+{\text{borne}}
+\right)
+\times
+\log(1+GWP_i).
+$$
+
+Cette normalisation permet d'éviter qu'un très grand portefeuille domine entièrement le classement tout en conservant la notion d'impact économique.
