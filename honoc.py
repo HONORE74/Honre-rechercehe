@@ -1,443 +1,602 @@
-Verification si juste avant de faire tous les merges  :: 
-
-# ---- VERIFICATION DU MERGE ----
-print("=" * 60)
-print(f"Lignes dans results_test   : {len(results_test):,}")
-print(f"Longueur de lower_bound    : {len(lower_bound):,}")
-print(f"Longueurs identiques ?     : {len(results_test) == len(lower_bound)}")
-
-n_nan = results_test['y_pred'].isna().sum()
-print(f"\ny_pred manquants (NaN)     : {n_nan:,}  ({n_nan/len(results_test):.2%})")
-
-print(f"\nCle ID_COLS unique dans df_final ? : {df_final[ID_COLS].duplicated().sum() == 0}")
-print(f"Cle ID_COLS unique dans df_test  ? : {df_test[ID_COLS].duplicated().sum() == 0}")
-print("=" * 60)
-
-if n_nan > 0:
-    print("\n/!\\ PROBLEME : des lignes de test n'ont pas de prediction associee.")
-    print("Exemples de lignes sans y_pred :")
-    print(results_test[results_test['y_pred'].isna()][ID_COLS].head(10).to_string())
-else:
-    print("\nOK : chaque ligne de test a bien une prediction.")
-
-
-Mision 3 : SUppresion de ceu xuiq sont present dans le test masi âs dans le trin ni calib
-
-import numpy as np, pandas as pd
-
-def filtrer_groupes_non_vus(df_train, df_calib, df_test, group_cols, verbose=True):
-    """Supprime du TEST les groupes absents a la fois du train ET de la calibration.
-    Justification : l'exchangeabilite conforme ne tient pas pour un groupe jamais vu."""
-    to_tuple = lambda d: set(map(tuple, d[group_cols].astype(str).drop_duplicates().values))
-    g_train, g_calib, g_test = to_tuple(df_train), to_tuple(df_calib), to_tuple(df_test)
-    vus     = g_train | g_calib
-    non_vus = g_test - vus
-
-    cle_test = df_test[group_cols].astype(str).apply(tuple, axis=1)
-    masque   = ~cle_test.isin(non_vus)
-    df_test_filtre = df_test[masque].copy()
-
-    if verbose:
-        print("=" * 72)
-        print(f"  Granularite du filtre : {group_cols}")
-        print(f"  Groupes en test              : {len(g_test):>5}")
-        print(f"  dont vus en train            : {len(g_test & g_train):>5}")
-        print(f"  dont vus en calibration seule: {len(g_test & g_calib - g_train):>5}")
-        print(f"  dont JAMAIS vus  -> SUPPRIMES: {len(non_vus):>5}")
-        print(f"\n  Lignes test avant : {len(df_test):>6,}")
-        print(f"  Lignes test apres : {len(df_test_filtre):>6,}  "
-              f"(-{(1-len(df_test_filtre)/len(df_test)):.2%})")
-        if non_vus:
-            print(f"\n  Exemples de groupes supprimes (max 10) :")
-            for g in list(non_vus)[:10]:
-                print(f"    {dict(zip(group_cols, g))}")
-        print("=" * 72)
-    return df_test_filtre, non_vus
-
-# Granularite : "Partner" seul (demande du sup) -- ou ID_COLS complet si tu preferes
-GROUP_FILTRE = ["Partner"]
-df_test_clean, groupes_supprimes = filtrer_groupes_non_vus(
-    df_train, df_calib, df_test, GROUP_FILTRE)
-
-# Comparaison des deux granularites, pour arbitrer
-print("\n--- Comparaison des granularites de filtrage ---")
-for cols in [["Partner"], ["Partner","Companies"], ID_COLS]:
-    _, nv = filtrer_groupes_non_vus(df_train, df_calib, df_test, cols, verbose=False)
-    cle  = df_test[cols].astype(str).apply(tuple, axis=1)
-    perdu = cle.isin(nv).mean()
-    print(f"  {str(cols):<55} -> {len(nv):>4} groupes, {perdu:.2%} des lignes perdues")
-
-
-
-Mission  1 : Couvertures marginale
-
-import matplotlib.pyplot as plt
-
-def couverture_marginale(results, alpha, segments=("Lob","Risk","Activity","Partner"),
-                         n_min_affiche=20):
-    """Couverture MARGINALE : un seul Q_hat global, mesuree globalement puis par segment."""
-    cible = 1 - alpha
-    globale = results["dans_intervalle"].mean()
-
-    print("=" * 78)
-    print(f"  COUVERTURE MARGINALE GLOBALE : {globale:.2%}   (cible {cible:.0%})")
-    print(f"  Ecart a la cible             : {globale - cible:+.2%}")
-    print(f"  Largeur moyenne              : {results['largeur_intervalle'].mean():,.0f}")
-    print(f"  Largeur mediane              : {results['largeur_intervalle'].median():,.0f}")
-    print("=" * 78)
-
-    tables = {}
-    for seg in segments:
-        if seg not in results.columns:
-            continue
-        t = (results.groupby(seg, observed=True)
-             .agg(n=("dans_intervalle","size"),
-                  couverture=("dans_intervalle","mean"),
-                  largeur_moy=("largeur_intervalle","mean"))
-             .query(f"n >= {n_min_affiche}")
-             .sort_values("couverture"))
-        t["ecart_cible"] = t["couverture"] - cible
-        tables[seg] = t
-        print(f"\n--- Segment : {seg}  ({len(t)} modalites avec n >= {n_min_affiche}) ---")
-        print(t.to_string(float_format=lambda v: f"{v:,.3f}"))
-        sous = t[t["couverture"] < cible - 0.05]
-        if len(sous):
-            print(f"  /!\\ {len(sous)} modalite(s) SOUS-COUVERTE(S) de plus de 5 pts : "
-                  f"{list(sous.index)}")
-    return tables
-
-def graphe_couverture(tables, alpha, max_modalites=15):
-    cible = 1 - alpha
-    segs = list(tables.keys())
-    fig, axes = plt.subplots(1, len(segs), figsize=(5.5*len(segs), 6))
-    axes = np.atleast_1d(axes)
-    for ax, seg in zip(axes, segs):
-        t = tables[seg].head(max_modalites)
-        couleurs = ["firebrick" if c < cible - 0.05 else
-                    "darkorange" if c < cible else "seagreen" for c in t["couverture"]]
-        ax.barh(range(len(t)), t["couverture"], color=couleurs)
-        ax.set_yticks(range(len(t))); ax.set_yticklabels(t.index, fontsize=8)
-        ax.axvline(cible, color="black", ls="--", lw=1.5, label=f"Cible {cible:.0%}")
-        ax.set_xlim(0, 1.02); ax.set_xlabel("Couverture empirique")
-        ax.set_title(f"Couverture marginale par {seg}")
-        ax.legend(fontsize=8)
-        for i, (c, n) in enumerate(zip(t["couverture"], t["n"])):
-            ax.text(c + 0.01, i, f"{c:.0%} (n={n})", va="center", fontsize=7)
-    plt.tight_layout(); plt.savefig("couverture_marginale.png", dpi=200); plt.show()
-
-tables_marg = couverture_marginale(results_test, ALPHA)
-graphe_couverture(tables_marg, ALPHA)
-
-Mission 2 : Couvertures Conditinnnelle 
-
-def conformal_mondrian(df_calib, y_calib, y_lo_calib, y_hi_calib,
-                       df_test, y_lo_test, y_hi_test,
-                       segment_col, alpha, n_min=30):
-    """Conformal MONDRIAN : un Q_hat calcule SEPAREMENT dans chaque segment.
-    Garantit la couverture 1-alpha a l'interieur de chaque groupe."""
+def conformal_conditionnel(df_calib, y_calib, y_lo_calib, y_hi_calib,
+                           df_test, y_lo_test, y_hi_test,
+                           segment_col, alpha, n_min=50):
+    """Le Q_hat n'est plus global : il est calcule DANS chaque segment."""
     scores = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib)
 
-    n_all   = len(scores)
-    q_all   = min(np.ceil((n_all + 1) * (1 - alpha)) / n_all, 1.0)
-    Q_global = np.quantile(scores, q_all, method="higher")
+    n_g = len(scores)
+    Q_global = np.quantile(scores, min(np.ceil((n_g+1)*(1-alpha))/n_g, 1.0), method="higher")
 
-    seg_calib = df_calib[segment_col].astype(str).values
-    table_Q = {}
-    for s in np.unique(seg_calib):
-        m = seg_calib == s
+    seg_cal = df_calib[segment_col].astype(str).values
+    Q_par_seg = {}
+    for s in np.unique(seg_cal):
+        m = seg_cal == s
         n = int(m.sum())
         if n < n_min:
-            table_Q[s] = (Q_global, n, "repli global")
+            Q_par_seg[s] = (Q_global, n, "repli global (n trop faible)")
         else:
-            q = min(np.ceil((n + 1) * (1 - alpha)) / n, 1.0)
-            table_Q[s] = (float(np.quantile(scores[m], q, method="higher")), n, "propre")
+            q_lvl = min(np.ceil((n + 1) * (1 - alpha)) / n, 1.0)
+            Q_par_seg[s] = (float(np.quantile(scores[m], q_lvl, method="higher")), n, "conditionnel")
 
     seg_test = df_test[segment_col].astype(str).values
-    Q_test = np.array([table_Q.get(s, (Q_global, 0, "absent calib"))[0] for s in seg_test])
+    Q_test = np.array([Q_par_seg.get(s, (Q_global, 0, "absent calib"))[0] for s in seg_test])
 
-    lower = np.clip(y_lo_test - Q_test, 0, None)
-    upper = y_hi_test + Q_test
+    print("=" * 76)
+    print(f"  Q_hat CONDITIONNEL par '{segment_col}'   (global de reference : {Q_global:,.0f})")
+    print(f"\n  {'segment':<26}{'n_calib':>9}{'Q_hat':>15}   statut")
+    for s, (q, n, st) in sorted(Q_par_seg.items(), key=lambda kv: -kv[1][0]):
+        ratio = q / Q_global
+        print(f"  {s:<26}{n:>9}{q:>15,.0f}  (x{ratio:.2f})  {st}")
+    print("=" * 76)
 
-    print("=" * 78)
-    print(f"  CONFORMAL MONDRIAN sur '{segment_col}'   (Q_hat global = {Q_global:,.0f})")
-    print(f"\n  {'segment':<28}{'n_calib':>9}{'Q_hat':>16}   statut")
-    for s, (q, n, st) in sorted(table_Q.items(), key=lambda kv: -kv[1][0]):
-        print(f"  {s:<28}{n:>9}{q:>16,.0f}   {st}")
-    print("=" * 78)
-    return lower, upper, table_Q, Q_global
-
-
-SEGMENT = "Lob"     # segment retenu pour la couverture conditionnelle
-
-lower_mond, upper_mond, table_Q, Q_global = conformal_mondrian(
-    df_calib, y_calib.values, y_lo_calib, y_hi_calib,
-    df_test_clean, y_lo_test, y_hi_test,
-    segment_col=SEGMENT, alpha=ALPHA)
-
-results_mond = results_test.copy()
-results_mond["borne_basse"] = lower_mond
-results_mond["borne_haute"] = upper_mond
-results_mond["largeur_intervalle"] = upper_mond - lower_mond
-results_mond["dans_intervalle"] = ((results_mond["y_obs"] >= results_mond["borne_basse"]) &
-                                   (results_mond["y_obs"] <= results_mond["borne_haute"]))
-
-print("\n--- Couverture CONDITIONNELLE apres Mondrian ---")
-tables_cond = couverture_marginale(results_mond, ALPHA, segments=(SEGMENT,))
-
-
-Mission 2 : Couverture conditionnelle (modrain)
-
-def conformal_mondrian(df_calib, y_calib, y_lo_calib, y_hi_calib,
-                       df_test, y_lo_test, y_hi_test,
-                       segment_col, alpha, n_min=30):
-    """Conformal MONDRIAN : un Q_hat calcule SEPAREMENT dans chaque segment.
-    Garantit la couverture 1-alpha a l'interieur de chaque groupe."""
-    scores = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib)
-
-    n_all   = len(scores)
-    q_all   = min(np.ceil((n_all + 1) * (1 - alpha)) / n_all, 1.0)
-    Q_global = np.quantile(scores, q_all, method="higher")
-
-    seg_calib = df_calib[segment_col].astype(str).values
-    table_Q = {}
-    for s in np.unique(seg_calib):
-        m = seg_calib == s
-        n = int(m.sum())
-        if n < n_min:
-            table_Q[s] = (Q_global, n, "repli global")
-        else:
-            q = min(np.ceil((n + 1) * (1 - alpha)) / n, 1.0)
-            table_Q[s] = (float(np.quantile(scores[m], q, method="higher")), n, "propre")
-
-    seg_test = df_test[segment_col].astype(str).values
-    Q_test = np.array([table_Q.get(s, (Q_global, 0, "absent calib"))[0] for s in seg_test])
-
-    lower = np.clip(y_lo_test - Q_test, 0, None)
-    upper = y_hi_test + Q_test
-
-    print("=" * 78)
-    print(f"  CONFORMAL MONDRIAN sur '{segment_col}'   (Q_hat global = {Q_global:,.0f})")
-    print(f"\n  {'segment':<28}{'n_calib':>9}{'Q_hat':>16}   statut")
-    for s, (q, n, st) in sorted(table_Q.items(), key=lambda kv: -kv[1][0]):
-        print(f"  {s:<28}{n:>9}{q:>16,.0f}   {st}")
-    print("=" * 78)
-    return lower, upper, table_Q, Q_global
-
-
-SEGMENT = "Lob"     # segment retenu pour la couverture conditionnelle
-
-lower_mond, upper_mond, table_Q, Q_global = conformal_mondrian(
-    df_calib, y_calib.values, y_lo_calib, y_hi_calib,
-    df_test_clean, y_lo_test, y_hi_test,
-    segment_col=SEGMENT, alpha=ALPHA)
-
-results_mond = results_test.copy()
-results_mond["borne_basse"] = lower_mond
-results_mond["borne_haute"] = upper_mond
-results_mond["largeur_intervalle"] = upper_mond - lower_mond
-results_mond["dans_intervalle"] = ((results_mond["y_obs"] >= results_mond["borne_basse"]) &
-                                   (results_mond["y_obs"] <= results_mond["borne_haute"]))
-
-print("\n--- Couverture CONDITIONNELLE apres Mondrian ---")
-tables_cond = couverture_marginale(results_mond, ALPHA, segments=(SEGMENT,))
-
-
-Comparaison visuelle conditionnelle / mondrian
-
-def comparer_marginal_mondrian(res_marg, res_mond, segment_col, alpha, n_min=20):
-    cible = 1 - alpha
-    a = (res_marg.groupby(segment_col, observed=True)
-         .agg(n=("dans_intervalle","size"), cov=("dans_intervalle","mean"),
-              larg=("largeur_intervalle","mean")).query(f"n >= {n_min}"))
-    b = (res_mond.groupby(segment_col, observed=True)
-         .agg(cov=("dans_intervalle","mean"), larg=("largeur_intervalle","mean")))
-    comp = a.join(b, lsuffix="_marg", rsuffix="_mond").sort_values("cov_marg")
-
-    fig, ax = plt.subplots(1, 2, figsize=(15, 6))
-    y = np.arange(len(comp)); h = 0.38
-    ax[0].barh(y - h/2, comp["cov_marg"], h, color="darkorange", label="Marginal (Q global)")
-    ax[0].barh(y + h/2, comp["cov_mond"], h, color="seagreen",   label="Mondrian (Q par segment)")
-    ax[0].axvline(cible, color="black", ls="--", lw=1.5, label=f"Cible {cible:.0%}")
-    ax[0].set_yticks(y); ax[0].set_yticklabels(comp.index, fontsize=8)
-    ax[0].set_xlim(0, 1.02); ax[0].set_xlabel("Couverture"); ax[0].legend(fontsize=8)
-    ax[0].set_title("Couverture par segment")
-
-    ax[1].barh(y - h/2, comp["larg_marg"], h, color="darkorange", label="Marginal")
-    ax[1].barh(y + h/2, comp["larg_mond"], h, color="seagreen",   label="Mondrian")
-    ax[1].set_yticks(y); ax[1].set_yticklabels(comp.index, fontsize=8)
-    ax[1].set_xlabel("Largeur moyenne (EUR)"); ax[1].legend(fontsize=8)
-    ax[1].set_title("Prix a payer : largeur des intervalles")
-
-    plt.tight_layout(); plt.savefig("comparaison_mondrian.png", dpi=200); plt.show()
-
-    ecart_m = (comp["cov_marg"] - cible).abs().mean()
-    ecart_c = (comp["cov_mond"] - cible).abs().mean()
-    print(f"\n  Ecart absolu moyen a la cible :")
-    print(f"    Marginal : {ecart_m:.2%}")
-    print(f"    Mondrian : {ecart_c:.2%}   ({(1-ecart_c/ecart_m)*100:+.0f} % d'amelioration)")
-    print(f"  Largeur moyenne  Marginal : {comp['larg_marg'].mean():,.0f}")
-    print(f"                   Mondrian : {comp['larg_mond'].mean():,.0f}")
-    return comp
-
-comparaison = comparer_marginal_mondrian(results_test, results_mond, SEGMENT, ALPHA)
+    return np.clip(y_lo_test - Q_test, 0, None), y_hi_test + Q_test, Q_par_seg, Q_global
 
 
 
 
 
-Visualisation :: 
+
+
+import lightgbm as lgb
+from sklearn.model_selection import cross_val_predict, StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+def tester_conditionnalite(X_test, results, alpha, n_splits=5):
+    """Test formel de couverture conditionnelle, sans segmentation arbitraire.
+    Principe : on essaie de PREDIRE la non-couverture a partir de X.
+    Si c'est possible (AUC > 0.5), la couverture n'est PAS conditionnelle."""
+    y_miss = (~results["dans_intervalle"]).astype(int).values
+
+    if y_miss.sum() < 20:
+        print("Trop peu de non-couvertures pour tester."); return None
+
+    clf = lgb.LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31,
+                             min_child_samples=40, reg_lambda=5.0,
+                             random_state=42, n_jobs=-1, verbose=-1)
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    proba = cross_val_predict(clf, X_test, y_miss, cv=cv, method="predict_proba")[:, 1]
+    auc = roc_auc_score(y_miss, proba)
+
+    # Test de permutation : l'AUC est-il significativement > 0.5 ?
+    rng = np.random.default_rng(42)
+    aucs_h0 = [roc_auc_score(rng.permutation(y_miss), proba) for _ in range(200)]
+    p_val = np.mean(np.array(aucs_h0) >= auc)
+
+    print("=" * 76)
+    print("  TEST DE COUVERTURE CONDITIONNELLE (sans segmentation arbitraire)")
+    print("=" * 76)
+    print(f"  Taux de non-couverture : {y_miss.mean():.2%}  (attendu {alpha:.0%})")
+    print(f"  AUC de prediction de la non-couverture : {auc:.4f}")
+    print(f"  p-value (permutation)                  : {p_val:.4f}")
+    print()
+    if auc > 0.60 and p_val < 0.05:
+        print("  --> COUVERTURE NON CONDITIONNELLE.")
+        print("      La non-couverture est PREDICTIBLE a partir de X : certaines")
+        print("      regions de l'espace sont systematiquement mal couvertes.")
+    elif auc > 0.55:
+        print("  --> Conditionnalite PARTIELLEMENT violee (signal faible mais present).")
+    else:
+        print("  --> Couverture approximativement conditionnelle : la non-couverture")
+        print("      est imprevisible a partir de X, ce qui est le comportement attendu.")
+
+    # Quelles variables expliquent la non-couverture ?
+    clf.fit(X_test, y_miss)
+    imp = (pd.Series(clf.booster_.feature_importance("gain"), index=X_test.columns)
+           .sort_values(ascending=False).head(10))
+    print(f"\n  Variables qui expliquent le mieux la non-couverture :")
+    print((imp / imp.sum() * 100).round(2).to_string())
+    print("=" * 76)
+    return {"auc": auc, "p_value": p_val, "importances": imp}
+
+diag_cond = tester_conditionnalite(X_test, results_test, ALPHA)
+
+
+
+
+
+
 
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
-from scipy import stats
+from matplotlib.lines import Line2D
 
-def valider_conformal(results, alpha, segment_cols=("Lob","Risk"), n_bins_ssc=5):
-    """Suite de validation complete d'un modele de Conformal Prediction.
-    results doit contenir : y_obs, y_pred, borne_basse, borne_haute,
-    largeur_intervalle, dans_intervalle."""
-    y   = results["y_obs"].values
-    lo  = results["borne_basse"].values
-    hi  = results["borne_haute"].values
-    w   = results["largeur_intervalle"].values
-    ok  = results["dans_intervalle"].values
-    n   = len(results)
+def intervalle_wilson(k, n, z=1.96):
+    """Intervalle de Wilson : plus fiable que l'approximation normale
+    quand n est petit ou la proportion proche de 0/1."""
+    if n == 0:
+        return np.nan, np.nan
+    p = k / n
+    d = 1 + z**2 / n
+    centre = (p + z**2 / (2*n)) / d
+    demi = (z / d) * np.sqrt(p*(1-p)/n + z**2/(4*n**2))
+    return max(0, centre - demi), min(1, centre + demi)
+
+
+def plot_couverture_conditionnelle(results, segment_col="Lob", alpha=0.10,
+                                   n_min=25, max_segments=30, tolerance=0.05,
+                                   trier=True, fichier=None):
+    """Couverture conditionnelle par segment.
+    x = segments | y = couverture | ligne horizontale a 1-alpha
+    Chaque point est relie a la ligne cible par une tige : la longueur = l'ecart."""
     cible = 1 - alpha
-    verdict = {}
 
-    # ================= AXE 1 : VALIDITE =================
-    cov = ok.mean()
-    se  = np.sqrt(cible * alpha / n)
-    ic_bas, ic_haut = cov - 1.96*np.sqrt(cov*(1-cov)/n), cov + 1.96*np.sqrt(cov*(1-cov)/n)
-    test = stats.binomtest(int(ok.sum()), n, cible)
-    valide = test.pvalue > 0.05
+    t = (results.groupby(segment_col, observed=True)["dans_intervalle"]
+         .agg(couverts="sum", n="size").reset_index())
+    t = t[t["n"] >= n_min].copy()
+    t["couverture"] = t["couverts"] / t["n"]
+    t[["ic_bas", "ic_haut"]] = t.apply(
+        lambda r: pd.Series(intervalle_wilson(r["couverts"], r["n"])), axis=1)
+    t["ecart"] = t["couverture"] - cible
 
-    print("=" * 80)
-    print("  AXE 1 -- VALIDITE (couverture marginale)")
-    print("=" * 80)
-    print(f"  Couverture observee   : {cov:.4f}   (cible {cible:.2f})")
-    print(f"  IC 95%                : [{ic_bas:.4f} ; {ic_haut:.4f}]")
-    print(f"  Ecart                 : {cov - cible:+.4f}  ({(cov-cible)/se:+.2f} ecarts-types)")
-    print(f"  Test binomial p-value : {test.pvalue:.4f}")
-    print(f"  --> {'VALIDE' if valide else 'NON VALIDE'} : "
-          f"{'couverture compatible avec la cible' if valide else 'ecart significatif a la cible'}")
-    verdict["validite"] = valide
+    if trier:
+        t = t.sort_values("couverture")
+    t = t.head(max_segments).reset_index(drop=True)
 
-    # ================= AXE 2 : EFFICACITE =================
-    larg_rel = w / np.maximum(np.abs(results['y_pred'].values), 1e-6)
-    print("\n" + "=" * 80)
-    print("  AXE 2 -- EFFICACITE (finesse des intervalles)")
-    print("=" * 80)
-    print(f"  Largeur moyenne       : {w.mean():>16,.0f} EUR")
-    print(f"  Largeur mediane       : {np.median(w):>16,.0f} EUR")
-    print(f"  Largeur relative med. : {np.median(larg_rel):>16.2f}  (largeur / prediction)")
-    print(f"  Intervalles > 200% de la prediction : {(larg_rel > 2).mean():.1%}")
+    # --- Statut statistique : l'IC contient-il la cible ? ---
+    def statut(r):
+        if r["ic_haut"] < cible:   return "sous_signif"
+        if r["ic_bas"]  > cible:   return "sur_signif"
+        if abs(r["ecart"]) <= tolerance: return "conforme"
+        return "ecart_non_signif"
 
-    # Score de Winkler (regle de score propre pour intervalles -- plus bas = mieux)
-    winkler = (hi - lo) + (2/alpha)*(lo - y)*(y < lo) + (2/alpha)*(y - hi)*(y > hi)
-    print(f"  Score de Winkler moyen: {winkler.mean():>16,.0f}   (plus bas = mieux)")
-    verdict["largeur_mediane"] = float(np.median(w))
-    verdict["winkler"] = float(winkler.mean())
+    t["statut"] = t.apply(statut, axis=1)
 
-    # ================= AXE 3 : ADAPTATIVITE =================
-    err = np.abs(y - results["y_pred"].values)
-    rho, p_rho = stats.spearmanr(w, err)
-    print("\n" + "=" * 80)
-    print("  AXE 3 -- ADAPTATIVITE (l'intervalle s'elargit-il quand l'erreur augmente ?)")
-    print("=" * 80)
-    print(f"  Correlation Spearman largeur/erreur : {rho:+.3f}  (p={p_rho:.2e})")
-    print(f"  --> {'BONNE adaptativite' if rho > 0.3 else 'adaptativite FAIBLE'}")
-    verdict["adaptativite"] = float(rho)
+    COULEURS = {"conforme":         "#2E8B57",   # vert  : dans la tolerance
+                "ecart_non_signif": "#DAA520",   # ambre : ecart non significatif
+                "sous_signif":      "#B22222",   # rouge : sous-couverture prouvee
+                "sur_signif":       "#4169E1"}   # bleu  : sur-couverture (gaspillage)
+    LABELS = {"conforme":         f"Conforme (ecart <= {tolerance:.0%})",
+              "ecart_non_signif": "Ecart non significatif",
+              "sous_signif":      "SOUS-couverture significative",
+              "sur_signif":       "SUR-couverture significative"}
 
-    # SSC : Size-Stratified Coverage -- couverture par tranche de LARGEUR
-    q = np.quantile(w, np.linspace(0, 1, n_bins_ssc + 1))
-    q[-1] += 1e-9
-    bins = pd.cut(w, bins=np.unique(q), include_lowest=True)
-    ssc = pd.DataFrame({"largeur_bin": bins, "couvert": ok}).groupby(
-        "largeur_bin", observed=True)["couvert"].agg(["size","mean"])
-    ssc.columns = ["n", "couverture"]
-    print(f"\n  SSC -- couverture par tranche de largeur d'intervalle :")
-    print(ssc.to_string(float_format=lambda v: f"{v:,.3f}"))
-    ssc_min = ssc["couverture"].min()
-    print(f"  --> SSC min = {ssc_min:.3f}  "
-          f"({'OK' if ssc_min > cible - 0.10 else 'ALERTE : une tranche est mal couverte'})")
-    verdict["ssc_min"] = float(ssc_min)
+    fig, ax = plt.subplots(figsize=(max(11, 0.55*len(t)), 7))
+    x = np.arange(len(t))
 
-    # ================= AXE 4 : COUVERTURE CONDITIONNELLE =================
-    print("\n" + "=" * 80)
-    print("  AXE 4 -- COUVERTURE CONDITIONNELLE (par segment metier)")
-    print("=" * 80)
-    ecarts_max = {}
-    for seg in segment_cols:
-        if seg not in results.columns: continue
-        t = (results.groupby(seg, observed=True)
-             .agg(n=("dans_intervalle","size"), cov=("dans_intervalle","mean"))
-             .query("n >= 20").sort_values("cov"))
-        if not len(t): continue
-        ec = (t["cov"] - cible).abs().max()
-        ecarts_max[seg] = float(ec)
-        print(f"\n  {seg} : {len(t)} modalites | ecart max a la cible = {ec:.3f}")
-        print(f"    pire  : {t.index[0]} -> {t['cov'].iloc[0]:.3f} (n={t['n'].iloc[0]})")
-        print(f"    meilleur : {t.index[-1]} -> {t['cov'].iloc[-1]:.3f} (n={t['n'].iloc[-1]})")
-    verdict["ecart_conditionnel_max"] = ecarts_max
+    # --- Bande de tolerance + ligne cible ---
+    ax.axhspan(cible - tolerance, cible + tolerance, color="#2E8B57", alpha=0.07, zorder=0)
+    ax.axhline(cible, color="black", ls="--", lw=2, zorder=2)
+    ax.text(len(t) - 0.4, cible + 0.006, f"Cible {cible:.0%}",
+            ha="right", va="bottom", fontsize=11, fontweight="bold")
 
-    # ================= VERDICT =================
-    print("\n" + "=" * 80)
-    print("  VERDICT DE VALIDATION")
-    print("=" * 80)
-    checks = [
-        ("Couverture marginale valide (test binomial)", valide),
-        ("Adaptativite suffisante (rho > 0.3)", rho > 0.3),
-        ("SSC min acceptable (> cible - 10 pts)", ssc_min > cible - 0.10),
-        ("Largeur relative mediane < 200%", np.median(larg_rel) < 2.0),
-        ("Ecart conditionnel max < 10 pts",
-         all(v < 0.10 for v in ecarts_max.values()) if ecarts_max else False),
-    ]
-    for label, res in checks:
-        print(f"  [{'OK ' if res else 'KO '}] {label}")
-    score = sum(r for _, r in checks)
-    print(f"\n  SCORE GLOBAL : {score}/{len(checks)}")
-    print("=" * 80)
-    return verdict, ssc
+    # --- Tiges : ecart a la cible ---
+    for xi, row in zip(x, t.itertuples()):
+        ax.vlines(xi, cible, row.couverture,
+                  color=COULEURS[row.statut], lw=2.2, alpha=0.55, zorder=3)
+
+    # --- Barres d'incertitude (Wilson) ---
+    ax.vlines(x, t["ic_bas"], t["ic_haut"], color="gray", lw=1.1, alpha=0.75, zorder=4)
+    for xi, lo, hi in zip(x, t["ic_bas"], t["ic_haut"]):
+        ax.hlines([lo, hi], xi - 0.12, xi + 0.12, color="gray", lw=1.1, alpha=0.75, zorder=4)
+
+    # --- Points : taille proportionnelle a l'effectif ---
+    tailles = 60 + 340 * (t["n"] - t["n"].min()) / max(t["n"].max() - t["n"].min(), 1)
+    ax.scatter(x, t["couverture"], s=tailles,
+               c=[COULEURS[s] for s in t["statut"]],
+               edgecolor="white", linewidth=1.6, zorder=6)
+
+    # --- Effectifs sous l'axe ---
+    for xi, row in zip(x, t.itertuples()):
+        ax.annotate(f"n={row.n}", (xi, 0.005), ha="center", va="bottom",
+                    fontsize=7, color="#555555")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(t[segment_col].astype(str), rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Taux de couverture observe", fontsize=12)
+    ax.set_xlabel(f"Segment  ({segment_col})", fontsize=12)
+    ax.set_ylim(0, 1.04)
+    ax.set_yticks(np.arange(0, 1.01, 0.1))
+    ax.set_yticklabels([f"{v:.0%}" for v in np.arange(0, 1.01, 0.1)])
+    ax.grid(axis="y", ls=":", alpha=0.4)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+
+    glob = results["dans_intervalle"].mean()
+    pire = t.loc[t["couverture"].idxmin()]
+    ax.set_title(f"Couverture conditionnelle par {segment_col}\n"
+                 f"Marginale globale : {glob:.1%}   |   "
+                 f"Pire segment : {pire[segment_col]} a {pire['couverture']:.1%}",
+                 fontsize=13, fontweight="bold", pad=14)
+
+    presents = [s for s in COULEURS if s in set(t["statut"])]
+    handles = [Line2D([0], [0], marker="o", color="w", markerfacecolor=COULEURS[s],
+                      markersize=11, label=LABELS[s]) for s in presents]
+    handles.append(Line2D([0], [0], color="gray", lw=1.2, label="IC 95% (Wilson)"))
+    ax.legend(handles=handles, fontsize=9, loc="lower right", framealpha=0.95)
+
+    plt.tight_layout()
+    plt.savefig(fichier or f"couverture_conditionnelle_{segment_col}.png", dpi=220)
+    plt.show()
+
+    print(f"\n{'='*72}")
+    print(f"  Segments analyses (n >= {n_min}) : {len(t)}")
+    for st in ["sous_signif", "sur_signif", "ecart_non_signif", "conforme"]:
+        c = (t["statut"] == st).sum()
+        if c:
+            print(f"    {LABELS[st]:<42} : {c}")
+    print(f"  Ecart absolu moyen a la cible : {t['ecart'].abs().mean():.2%}")
+    print(f"{'='*72}")
+    return t
+
+tab_lob = plot_couverture_conditionnelle(results_test, "Lob", ALPHA)
 
 
-def graphes_validation(results, alpha, ssc):
-    y = results["y_obs"].values; w = results["largeur_intervalle"].values
-    err = np.abs(y - results["y_pred"].values); ok = results["dans_intervalle"].values
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_multi_segments(results, segment_cols=("Lob","Risk","Activity","Periodicity"),
+                        alpha=0.10, n_min=25, max_seg=15, tolerance=0.05):
     cible = 1 - alpha
-    fig, ax = plt.subplots(2, 2, figsize=(15, 11))
+    cols = [c for c in segment_cols if c in results.columns]
+    fig, axes = plt.subplots(1, len(cols), figsize=(5.2*len(cols), 6.5), sharey=True)
+    axes = np.atleast_1d(axes)
 
-    # 1. Couverture cumulee (stabilite de la garantie)
-    cum = np.cumsum(ok) / np.arange(1, len(ok) + 1)
-    ax[0,0].plot(cum, color="steelblue", lw=1.2)
-    ax[0,0].axhline(cible, color="red", ls="--", label=f"Cible {cible:.0%}")
-    ax[0,0].set_ylim(0.5, 1.02); ax[0,0].set_xlabel("Nombre d'observations")
-    ax[0,0].set_ylabel("Couverture cumulee")
-    ax[0,0].set_title("Axe 1 : convergence de la couverture"); ax[0,0].legend()
+    for ax, col in zip(axes, cols):
+        t = (results.groupby(col, observed=True)["dans_intervalle"]
+             .agg(k="sum", n="size").reset_index())
+        t = t[t["n"] >= n_min].copy()
+        if not len(t):
+            ax.set_visible(False); continue
+        t["cov"] = t["k"] / t["n"]
+        t[["lo","hi"]] = t.apply(lambda r: pd.Series(intervalle_wilson(r["k"], r["n"])), axis=1)
+        t = t.sort_values("cov").head(max_seg).reset_index(drop=True)
+        x = np.arange(len(t))
+        coul = ["#B22222" if h < cible else "#4169E1" if l > cible
+                else "#2E8B57" if abs(c-cible) <= tolerance else "#DAA520"
+                for c, l, h in zip(t["cov"], t["lo"], t["hi"])]
 
-    # 2. SSC
-    ax[0,1].bar(range(len(ssc)), ssc["couverture"], color="seagreen")
-    ax[0,1].axhline(cible, color="red", ls="--", label=f"Cible {cible:.0%}")
-    ax[0,1].set_xticks(range(len(ssc)))
-    ax[0,1].set_xticklabels([f"Q{i+1}" for i in range(len(ssc))])
-    ax[0,1].set_xlabel("Tranche de largeur d'intervalle (croissante)")
-    ax[0,1].set_ylabel("Couverture")
-    ax[0,1].set_title("Axe 3 : Size-Stratified Coverage"); ax[0,1].legend()
+        ax.axhspan(cible-tolerance, cible+tolerance, color="#2E8B57", alpha=0.07)
+        ax.axhline(cible, color="black", ls="--", lw=1.8)
+        ax.vlines(x, cible, t["cov"], color=coul, lw=2, alpha=0.55)
+        ax.vlines(x, t["lo"], t["hi"], color="gray", lw=1, alpha=0.7)
+        ax.scatter(x, t["cov"], s=90, c=coul, edgecolor="white", linewidth=1.3, zorder=5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(t[col].astype(str), rotation=60, ha="right", fontsize=8)
+        ax.set_title(f"{col}  ({len(t)} modalites)", fontsize=11, fontweight="bold")
+        ax.grid(axis="y", ls=":", alpha=0.4); ax.set_axisbelow(True)
+        for s in ("top","right"): ax.spines[s].set_visible(False)
 
-    # 3. Adaptativite : largeur vs erreur
-    ax[1,0].scatter(w[ok], err[ok], s=8, alpha=.3, color="royalblue", label="Couvert")
-    ax[1,0].scatter(w[~ok], err[~ok], s=20, alpha=.7, color="red", label="Anomalie")
-    ax[1,0].set_xlabel("Largeur de l'intervalle"); ax[1,0].set_ylabel("Erreur absolue")
-    ax[1,0].set_title("Axe 3 : adaptativite (largeur vs erreur)"); ax[1,0].legend()
+    axes[0].set_ylabel("Couverture observee", fontsize=12)
+    axes[0].set_ylim(0, 1.04)
+    axes[0].set_yticks(np.arange(0, 1.01, 0.1))
+    axes[0].set_yticklabels([f"{v:.0%}" for v in np.arange(0, 1.01, 0.1)])
+    fig.suptitle(f"Couverture conditionnelle -- toutes dimensions  "
+                 f"(cible {cible:.0%}, marginale {results['dans_intervalle'].mean():.1%})",
+                 fontsize=13, fontweight="bold", y=1.00)
+    plt.tight_layout()
+    plt.savefig("couverture_multi_segments.png", dpi=220); plt.show()
 
-    # 4. Distribution des largeurs
-    ax[1,1].hist(w, bins=50, color="slateblue", alpha=.75)
-    ax[1,1].axvline(np.median(w), color="red", ls="--",
-                    label=f"Mediane = {np.median(w):,.0f}")
-    ax[1,1].set_xlabel("Largeur (EUR)"); ax[1,1].set_ylabel("Frequence")
-    ax[1,1].set_title("Axe 2 : distribution des largeurs"); ax[1,1].legend()
-
-    plt.tight_layout(); plt.savefig("validation_conformal.png", dpi=200); plt.show()
+plot_multi_segments(results_test, alpha=ALPHA)
 
 
-verdict, ssc = valider_conformal(results_test, ALPHA)
-graphes_validation(results_test, ALPHA, ssc)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def plot_avant_apres(res_marg, res_mond, segment_col="Lob", alpha=0.10,
+                     n_min=25, max_seg=20):
+    cible = 1 - alpha
+    a = res_marg.groupby(segment_col, observed=True)["dans_intervalle"].agg(k="sum", n="size")
+    b = res_mond.groupby(segment_col, observed=True)["dans_intervalle"].agg(k="sum", n="size")
+    t = a.join(b, lsuffix="_m", rsuffix="_c")
+    t = t[t["n_m"] >= n_min].copy()
+    t["cov_marg"] = t["k_m"] / t["n_m"]
+    t["cov_mond"] = t["k_c"] / t["n_c"]
+    t = t.sort_values("cov_marg").head(max_seg).reset_index()
+    x = np.arange(len(t))
+
+    fig, ax = plt.subplots(figsize=(max(11, 0.6*len(t)), 7))
+    ax.axhspan(cible-0.05, cible+0.05, color="#2E8B57", alpha=0.07)
+    ax.axhline(cible, color="black", ls="--", lw=2)
+    ax.text(len(t)-0.4, cible+0.006, f"Cible {cible:.0%}", ha="right", fontsize=11,
+            fontweight="bold")
+
+    # fleches du marginal vers le Mondrian
+    for xi, r in zip(x, t.itertuples()):
+        ax.annotate("", xy=(xi, r.cov_mond), xytext=(xi, r.cov_marg),
+                    arrowprops=dict(arrowstyle="-|>", color="#888888", lw=1.6,
+                                    shrinkA=4, shrinkB=4))
+    ax.scatter(x, t["cov_marg"], s=130, c="#DAA520", edgecolor="white", lw=1.5,
+               zorder=5, label="Avant : Q_hat global (marginal)")
+    ax.scatter(x, t["cov_mond"], s=130, c="#2E8B57", edgecolor="white", lw=1.5,
+               zorder=5, marker="D", label="Apres : Q_hat par segment (conditionnel)")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(t[segment_col].astype(str), rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Couverture observee", fontsize=12)
+    ax.set_xlabel(f"Segment  ({segment_col})", fontsize=12)
+    ax.set_ylim(0, 1.04); ax.set_yticks(np.arange(0, 1.01, 0.1))
+    ax.set_yticklabels([f"{v:.0%}" for v in np.arange(0, 1.01, 0.1)])
+    ax.grid(axis="y", ls=":", alpha=0.4); ax.set_axisbelow(True)
+    for s in ("top","right"): ax.spines[s].set_visible(False)
+
+    e_m = (t["cov_marg"] - cible).abs().mean()
+    e_c = (t["cov_mond"] - cible).abs().mean()
+    ax.set_title(f"Effet du conditionnement du Q_hat sur la couverture\n"
+                 f"Ecart absolu moyen : {e_m:.2%} -> {e_c:.2%}  "
+                 f"({(1-e_c/e_m)*100:+.0f} %)",
+                 fontsize=13, fontweight="bold", pad=14)
+    ax.legend(fontsize=10, loc="lower right", framealpha=0.95)
+    plt.tight_layout(); plt.savefig("avant_apres_mondrian.png", dpi=220); plt.show()
+    return t
+
+# a lancer apres avoir construit results_mond avec le Q_hat conditionnel
+comp = plot_avant_apres(results_test, results_mond, "Lob", ALPHA)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+def plot_funnel(results, segment_cols=("Lob","Risk","Activity","Periodicity","Partner"),
+                alpha=0.10, n_min=8):
+    """Funnel plot : couverture vs effectif, avec l'entonnoir de variation attendue.
+    Hors entonnoir = decrochage REEL. Dans l'entonnoir = bruit d'echantillonnage."""
+    cible = 1 - alpha
+    pts = []
+    for col in [c for c in segment_cols if c in results.columns]:
+        g = results.groupby(col, observed=True)["dans_intervalle"].agg(k="sum", n="size")
+        for mod, r in g[g["n"] >= n_min].iterrows():
+            pts.append({"dim": col, "mod": str(mod)[:22],
+                        "n": int(r["n"]), "cov": r["k"]/r["n"]})
+    p = pd.DataFrame(pts)
+
+    n_grille = np.linspace(p["n"].min(), p["n"].max(), 400)
+    b95 = 1.96 * np.sqrt(cible*(1-cible)/n_grille)
+    b99 = 2.58 * np.sqrt(cible*(1-cible)/n_grille)
+
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    ax.fill_between(n_grille, cible-b99, cible+b99, color="#B0C4DE", alpha=0.25,
+                    label="Entonnoir 99 %")
+    ax.fill_between(n_grille, cible-b95, cible+b95, color="#4682B4", alpha=0.22,
+                    label="Entonnoir 95 %")
+    ax.axhline(cible, color="black", ls="--", lw=2, label=f"Cible {cible:.0%}")
+
+    seuil = 1.96*np.sqrt(cible*(1-cible)/p["n"])
+    p["hors"] = (p["cov"] < cible - seuil) | (p["cov"] > cible + seuil)
+    p["sens"] = np.where(p["cov"] < cible, "sous", "sur")
+
+    dedans = p[~p["hors"]]
+    ax.scatter(dedans["n"], dedans["cov"], s=45, c="#9E9E9E", alpha=0.55,
+               edgecolor="white", lw=0.8, zorder=4)
+    for sens, coul, lab in [("sous", "#B22222", "Sous-couverture REELLE"),
+                            ("sur",  "#4169E1", "Sur-couverture REELLE")]:
+        d = p[p["hors"] & (p["sens"] == sens)]
+        ax.scatter(d["n"], d["cov"], s=130, c=coul, edgecolor="white", lw=1.5,
+                   zorder=6, label=lab)
+        for r in d.nlargest(min(6, len(d)), "n").itertuples():
+            ax.annotate(f"{r.dim}={r.mod}", (r.n, r.cov), fontsize=7.5,
+                        xytext=(7, 0), textcoords="offset points", va="center")
+
+    ax.scatter([], [], s=45, c="#9E9E9E", label="Ecart compatible avec le hasard")
+    ax.set_xlabel("Effectif du segment (n)", fontsize=12)
+    ax.set_ylabel("Couverture observee", fontsize=12)
+    ax.set_ylim(0, 1.05)
+    ax.set_yticks(np.arange(0, 1.01, 0.1))
+    ax.set_yticklabels([f"{v:.0%}" for v in np.arange(0, 1.01, 0.1)])
+    ax.grid(ls=":", alpha=0.35); ax.set_axisbelow(True)
+    for s in ("top","right"): ax.spines[s].set_visible(False)
+    ax.set_title(f"Funnel plot -- {p['hors'].sum()} segments hors entonnoir sur {len(p)}\n"
+                 f"L'entonnoir se resserre quand n augmente : un petit segment PEUT devier sans alerte",
+                 fontsize=13, fontweight="bold", pad=14)
+    ax.legend(fontsize=9, loc="lower right", framealpha=0.95)
+    plt.tight_layout(); plt.savefig("funnel_couverture.png", dpi=220); plt.show()
+    return p.sort_values("cov")
+
+funnel = plot_funnel(results_test, alpha=ALPHA)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+
+def plot_arbre_non_couverture(results, X_test, alpha=0.10, max_depth=3, min_leaf=40):
+    """Un arbre apprend OU la couverture echoue. Aucune segmentation choisie a l'avance."""
+    y_miss = (~results["dans_intervalle"]).astype(int).values
+
+    X = X_test.copy()
+    for c in X.columns:
+        if X[c].dtype == object or str(X[c].dtype) == "category":
+            X[c] = X[c].astype("category").cat.codes
+    X = X.fillna(-999)
+
+    arbre = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf,
+                                   random_state=42)
+    arbre.fit(X, y_miss)
+
+    fig, ax = plt.subplots(1, 2, figsize=(19, 8),
+                           gridspec_kw={"width_ratios": [1.5, 1]})
+    plot_tree(arbre, feature_names=list(X.columns), class_names=["couvert","MANQUE"],
+              filled=True, rounded=True, fontsize=7.5, ax=ax[0], impurity=False,
+              proportion=True)
+    ax[0].set_title("Regions ou la couverture echoue (decouvertes automatiquement)",
+                    fontsize=12, fontweight="bold")
+
+    feuille = arbre.apply(X)
+    res = (pd.DataFrame({"feuille": feuille, "manque": y_miss})
+           .groupby("feuille")["manque"].agg(taux="mean", n="size")
+           .sort_values("taux"))
+    coul = ["#B22222" if t > alpha*2 else "#DAA520" if t > alpha*1.3 else "#2E8B57"
+            for t in res["taux"]]
+    ax[1].barh(range(len(res)), res["taux"], color=coul)
+    ax[1].axvline(alpha, color="black", ls="--", lw=2, label=f"Taux attendu {alpha:.0%}")
+    ax[1].set_yticks(range(len(res)))
+    ax[1].set_yticklabels([f"Feuille {f} (n={n})" for f, n in zip(res.index, res["n"])],
+                          fontsize=9)
+    ax[1].set_xlabel("Taux de NON-couverture", fontsize=11)
+    ax[1].set_title("Taux de manque par region decouverte", fontsize=12, fontweight="bold")
+    ax[1].legend(fontsize=9)
+    for i, (t, n) in enumerate(zip(res["taux"], res["n"])):
+        ax[1].text(t + 0.005, i, f"{t:.1%}", va="center", fontsize=8)
+    for s in ("top","right"): ax[1].spines[s].set_visible(False)
+
+    plt.tight_layout(); plt.savefig("arbre_non_couverture.png", dpi=220); plt.show()
+
+    print("=" * 76)
+    print(f"  Taux de non-couverture global : {y_miss.mean():.2%}  (attendu {alpha:.0%})")
+    print(f"  Pire region  : {res['taux'].iloc[-1]:.2%}  (n={res['n'].iloc[-1]})")
+    print(f"  Meilleure    : {res['taux'].iloc[0]:.2%}  (n={res['n'].iloc[0]})")
+    print(f"  Amplitude    : {res['taux'].iloc[-1] - res['taux'].iloc[0]:.2%}")
+    print(f"\n  Si l'amplitude est large, la couverture n'est PAS conditionnelle.")
+    print("=" * 76)
+    return arbre, res
+
+arbre, feuilles = plot_arbre_non_couverture(results_test, X_test, ALPHA)
+
+
+
+
+
+
+
+
+
+def plot_bubble_couverture_largeur(results, segment_col="Lob", alpha=0.10, n_min=25):
+    cible = 1 - alpha
+    t = (results.groupby(segment_col, observed=True)
+         .agg(n=("dans_intervalle","size"), cov=("dans_intervalle","mean"),
+              larg=("largeur_intervalle","median"),
+              pred=("y_pred","median")).reset_index())
+    t = t[t["n"] >= n_min].copy()
+    t["larg_rel"] = t["larg"] / t["pred"].abs().clip(lower=1e-6)
+    med_rel = t["larg_rel"].median()
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.axvline(cible, color="black", ls="--", lw=2)
+    ax.axhline(med_rel, color="gray", ls=":", lw=1.5)
+
+    quad = {"ideal": ("#2E8B57", "Ideal : couvert et etroit"),
+            "conserv": ("#4169E1", "Conservateur : couvert mais large"),
+            "danger": ("#B22222", "DANGER : etroit ET mal couvert"),
+            "casse": ("#8B0000", "Casse : large ET mal couvert")}
+    def q(r):
+        ok, etroit = r["cov"] >= cible - 0.02, r["larg_rel"] <= med_rel
+        return "ideal" if (ok and etroit) else "conserv" if ok else \
+               "danger" if etroit else "casse"
+    t["quad"] = t.apply(q, axis=1)
+
+    tailles = 100 + 900 * (t["n"] - t["n"].min()) / max(t["n"].max()-t["n"].min(), 1)
+    ax.scatter(t["cov"], t["larg_rel"], s=tailles,
+               c=[quad[k][0] for k in t["quad"]], alpha=0.72,
+               edgecolor="white", linewidth=1.8, zorder=5)
+    for r in t.itertuples():
+        ax.annotate(str(getattr(r, segment_col))[:16], (r.cov, r.larg_rel),
+                    fontsize=8, ha="center", va="center", zorder=6)
+
+    ax.text(cible+0.005, ax.get_ylim()[1]*0.97, f"Cible {cible:.0%}", fontsize=10,
+            fontweight="bold", va="top")
+    ax.set_xlabel("Couverture observee", fontsize=12)
+    ax.set_ylabel("Largeur relative mediane  (largeur / prediction)", fontsize=12)
+    ax.set_xlim(min(0.4, t["cov"].min()-0.05), 1.02)
+    ax.grid(ls=":", alpha=0.35); ax.set_axisbelow(True)
+    for s in ("top","right"): ax.spines[s].set_visible(False)
+    ax.set_title(f"Arbitrage couverture / finesse par {segment_col}\n"
+                 "Taille du disque = effectif du segment",
+                 fontsize=13, fontweight="bold", pad=14)
+    handles = [Line2D([0],[0], marker="o", color="w", markerfacecolor=c, markersize=12,
+                      label=l) for k,(c,l) in quad.items() if k in set(t["quad"])]
+    ax.legend(handles=handles, fontsize=9, loc="upper left", framealpha=0.95)
+    plt.tight_layout(); plt.savefig("bubble_couverture_largeur.png", dpi=220); plt.show()
+    return t
+
+bulles = plot_bubble_couverture_largeur(results_test, "Lob", ALPHA)
+
+
+
+
+
+
+
+
+def plot_carte_couverture(results, alpha=0.10, n_bins=6, n_min_cell=15):
+    cible = 1 - alpha
+    d = results.copy()
+    d["bx"] = pd.qcut(d["y_pred"], n_bins, labels=False, duplicates="drop")
+    d["by"] = pd.qcut(d["largeur_intervalle"], n_bins, labels=False, duplicates="drop")
+    g = d.groupby(["by","bx"], observed=True)["dans_intervalle"].agg(["mean","size"])
+    mat = g["mean"].unstack().reindex(index=range(n_bins), columns=range(n_bins))
+    cnt = g["size"].unstack().reindex(index=range(n_bins), columns=range(n_bins))
+
+    fig, ax = plt.subplots(figsize=(10.5, 8.5))
+    m = mat.copy(); m[cnt < n_min_cell] = np.nan
+    im = ax.imshow(m.values, cmap="RdYlGn", vmin=cible-0.30, vmax=cible+0.08,
+                   origin="lower", aspect="auto")
+    for i in range(n_bins):
+        for j in range(n_bins):
+            v, c = mat.values[i,j], cnt.values[i,j]
+            if not np.isnan(v) and c >= n_min_cell:
+                ax.text(j, i, f"{v:.0%}\nn={int(c)}", ha="center", va="center",
+                        fontsize=8, fontweight="bold" if v < cible-0.08 else "normal")
+    ax.set_xticks(range(n_bins)); ax.set_xticklabels([f"D{i+1}" for i in range(n_bins)])
+    ax.set_yticks(range(n_bins)); ax.set_yticklabels([f"D{i+1}" for i in range(n_bins)])
+    ax.set_xlabel("Decile de PREDICTION (croissante)", fontsize=12)
+    ax.set_ylabel("Decile de LARGEUR d'intervalle (croissante)", fontsize=12)
+    ax.set_title(f"Carte de couverture conditionnelle 2D  (cible {cible:.0%})\n"
+                 "Chaque case = une region de l'espace, sans segmentation metier",
+                 fontsize=13, fontweight="bold", pad=14)
+    cb = plt.colorbar(im, ax=ax); cb.set_label("Couverture", fontsize=11)
+    plt.tight_layout(); plt.savefig("carte_couverture_2d.png", dpi=220); plt.show()
+
+    plat = mat.values[~np.isnan(mat.values)]
+    print(f"  Couverture min sur la carte : {plat.min():.1%}")
+    print(f"  Couverture max sur la carte : {plat.max():.1%}")
+    print(f"  Amplitude : {plat.max()-plat.min():.1%}  "
+          f"(si > 20 pts, la couverture n'est clairement pas conditionnelle)")
+    return mat, cnt
+
+carte, effectifs = plot_carte_couverture(results_test, ALPHA)
+
+
 
