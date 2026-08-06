@@ -1,271 +1,408 @@
-import numpy as np, pandas as pd, matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from matplotlib.lines import Line2D
-
-def preparer_trois_variantes(df_calib, y_calib, y_lo_calib, y_hi_calib,
-                             df_test, y_lo_test, y_hi_test, y_test,
-                             segment_col, alpha=0.10, n_min=40):
-    """Construit les 3 scenarios : sans conformalisation / marginale / conditionnelle."""
-    scores = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib)
-    n = len(scores)
-    Q_glob = np.quantile(scores, min(np.ceil((n+1)*(1-alpha))/n, 1.0), method="higher")
-
-    seg_cal = df_calib[segment_col].astype(str).values
-    Q_seg = {}
-    for s in np.unique(seg_cal):
-        m = seg_cal == s; k = int(m.sum())
-        if k < n_min:
-            Q_seg[s] = Q_glob
-        else:
-            Q_seg[s] = float(np.quantile(scores[m],
-                        min(np.ceil((k+1)*(1-alpha))/k, 1.0), method="higher"))
-    seg_te = df_test[segment_col].astype(str).values
-    Q_te = np.array([Q_seg.get(s, Q_glob) for s in seg_te])
-
-    variantes = {
-        "Sans conformalisation": (np.clip(y_lo_test, 0, None),          y_hi_test),
-        "Couverture marginale":  (np.clip(y_lo_test - Q_glob, 0, None), y_hi_test + Q_glob),
-        "Couverture conditionnelle": (np.clip(y_lo_test - Q_te, 0, None), y_hi_test + Q_te),
-    }
-    out = {}
-    for nom, (lo, hi) in variantes.items():
-        out[nom] = pd.DataFrame({"y_obs": np.asarray(y_test, float),
-                                 "borne_basse": lo, "borne_haute": hi,
-                                 "largeur": hi - lo, "segment": seg_te,
-                                 "couvert": (np.asarray(y_test, float) >= lo) &
-                                            (np.asarray(y_test, float) <= hi)})
-    return out, Q_glob, Q_seg
-
-
-def figure_reference(variantes, alpha=0.10, n_points=180, n_groupes=2, seed=42):
-    """Reproduction de la figure canonique : 3 colonnes x 2 lignes."""
-    rng = np.random.default_rng(seed)
-    ref = list(variantes.values())[0]
-    groupes = ref["segment"].value_counts().head(n_groupes).index.tolist()
-
-    fig = plt.figure(figsize=(16.5, 9.5))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.25], hspace=0.28, wspace=0.16)
-    VERT, ROUGE, JAUNE = "#5CB85C", "#D9534F", "#F0C419"
-
-    for j, (nom, d) in enumerate(variantes.items()):
-        # ---------- Ligne 1 : disques de points par groupe ----------
-        ax = fig.add_subplot(gs[0, j]); ax.set_xlim(-1.15, 2.35); ax.set_ylim(-1.5, 1.5)
-        ax.axis("off"); ax.set_aspect("equal")
-        for g, cx in zip(groupes, [0.0, 2.0] if n_groupes == 2 else np.arange(n_groupes)*2.0):
-            sub = d[d["segment"] == g]
-            if not len(sub): continue
-            ech = sub.sample(min(n_points, len(sub)), random_state=seed)
-            r = np.sqrt(rng.random(len(ech))); th = rng.random(len(ech)) * 2*np.pi
-            ax.add_patch(Circle((cx, 0), 1.0, facecolor="none",
-                                edgecolor="#999999", lw=1.3))
-            ax.scatter(cx + r*np.cos(th)*0.93, r*np.sin(th)*0.93, s=13,
-                       c=np.where(ech["couvert"], VERT, ROUGE), alpha=0.85)
-            ax.text(cx, 1.16, str(g)[:16], ha="center", fontsize=10, fontweight="bold")
-            ax.text(cx, -1.28, f"{sub['couvert'].mean():.0%} de couverture",
-                    ha="center", fontsize=10.5, fontweight="bold")
-        ax.set_title(nom, fontsize=14, fontweight="bold", pad=14)
-        if j == 0:
-            ax.text(-1.45, 0, "Erreurs par groupe", rotation=90, va="center",
-                    fontsize=11.5, fontweight="bold")
-
-        # ---------- Ligne 2 : bandes d'intervalles ----------
-        ax2 = fig.add_subplot(gs[1, j])
-        s = d.sort_values("borne_haute").reset_index(drop=True)
-        p95 = np.percentile(s["y_obs"], 95)
-        s = s[s["y_obs"] <= p95].reset_index(drop=True)
-        x = np.arange(len(s))
-        ax2.fill_between(x, s["borne_basse"], s["borne_haute"],
-                         color=JAUNE, alpha=0.45, zorder=1)
-        ax2.plot(x, s["borne_basse"], color="#C9A200", lw=1.6, zorder=2)
-        ax2.plot(x, s["borne_haute"], color="#C9A200", lw=1.6, zorder=2)
-        ok = s["couvert"].values
-        ax2.scatter(x[ok],  s.loc[ok, "y_obs"],  s=7, color="#333333", alpha=0.55, zorder=3)
-        ax2.scatter(x[~ok], s.loc[~ok, "y_obs"], s=16, color=ROUGE, zorder=4)
-        ax2.set_xlabel("Observations triees", fontsize=10)
-        ax2.set_xticks([])
-        cov = d["couvert"].mean()
-        larg = d["largeur"].median()
-        ax2.set_title(f"Couverture globale {cov:.1%}   |   largeur mediane {larg:,.0f} EUR",
-                      fontsize=10.5)
-        if j == 0:
-            ax2.set_ylabel("Intervalles de prediction", fontsize=11.5, fontweight="bold")
-
-    fig.legend(handles=[
-        Line2D([0],[0], marker="o", color="w", markerfacecolor=VERT, markersize=11,
-               label="Observation correctement couverte"),
-        Line2D([0],[0], marker="o", color="w", markerfacecolor=ROUGE, markersize=11,
-               label="Observation NON couverte"),
-        Line2D([0],[0], color=JAUNE, lw=9, alpha=0.6, label="Intervalle de prediction")],
-        loc="upper center", ncol=3, fontsize=11, frameon=False, bbox_to_anchor=(0.5, 1.005))
-    fig.suptitle(f"Sans couverture  /  marginale  /  conditionnelle   "
-                 f"(cible {1-alpha:.0%})", fontsize=15, fontweight="bold", y=1.06)
-    plt.savefig("figure_reference_couverture.png", dpi=220, bbox_inches="tight")
-    plt.show()
-
-
-variantes, Q_glob, Q_seg = preparer_trois_variantes(
-    df_calib, y_calib.values, y_lo_calib, y_hi_calib,
-    df_test, y_lo_test, y_hi_test, y_test.values,
-    segment_col="Lob", alpha=ALPHA)
-figure_reference(variantes, alpha=ALPHA)
 
 
 
+Le principe en une phrase
+Un funnel plot compare une mesure (ta couverture) à la précision de cette mesure (l'effectif du groupe), pour distinguer une vraie anomalie d'un simple effet de petit échantillon.
 
+Pourquoi c'est nécessaire
+Avec 10 observations, obtenir 70 % ou 100 % de couverture n'a rien d'étonnant — le hasard suffit à l'expliquer. Avec 5 000 observations, un écart de seulement 3 points est déjà suspect. La même valeur observée n'a pas le même sens selon l'effectif derrière elle. Une ligne horizontale unique à 90 % (comme dans le dot plot de ton tuteur) ne fait pas cette distinction.
 
-
-
-
-
-
+import numpy as np, pandas as pd
 import plotly.graph_objects as go
 
-def interactif_trois_scenarios(variantes, alpha=0.10, n_min=25,
-                               fichier="cp_trois_scenarios.html"):
+# Palette : vert = comportement normal, rouge = decrochage reel (hors entonnoir)
+COULEUR_OK       = "#0ca30c"   # status "good"
+COULEUR_ALERTE   = "#d03b3b"   # status "critical"
+COULEUR_BANDE_95 = "#9ec5f4"   # sequentiel bleu, step clair
+COULEUR_BANDE_99 = "#cde2fb"   # sequentiel bleu, step tres clair
+COULEUR_CIBLE    = "#0b0b0b"   # encre primaire
+
+
+def funnel_interactif(results, segment_col="Lob", alpha=0.10, n_min=8,
+                      fichier=None):
+    """Funnel plot INTERACTIF sur UNE SEULE variable.
+    x = effectif du segment | y = couverture observee.
+    L'entonnoir (bleu) borne la variation attendue par hasard : un point
+    HORS entonnoir est un decrochage reel, pas du bruit d'echantillonnage."""
     cible = 1 - alpha
+
+    g = (results.groupby(segment_col, observed=True)["dans_intervalle"]
+         .agg(k="sum", n="size").reset_index())
+    g = g[g["n"] >= n_min].copy()
+    g["cov"] = g["k"] / g["n"]
+
+    # --- Bornes de l'entonnoir (approximation normale de la proportion) ---
+    n_grille = np.linspace(g["n"].min(), g["n"].max(), 300)
+    b95 = 1.96 * np.sqrt(cible * (1 - cible) / n_grille)
+    b99 = 2.58 * np.sqrt(cible * (1 - cible) / n_grille)
+
+    seuil95 = 1.96 * np.sqrt(cible * (1 - cible) / g["n"])
+    g["hors_entonnoir"] = (g["cov"] < cible - seuil95) | (g["cov"] > cible + seuil95)
+    g["ecart"] = g["cov"] - cible
+
     fig = go.Figure()
-    boutons, noms = [], list(variantes)
 
-    for k, nom in enumerate(noms):
-        d = variantes[nom]
-        t = (d.groupby("segment")["couvert"].agg(k_="sum", n="size").reset_index())
-        t = t[t["n"] >= n_min]
-        t["cov"] = t["k_"] / t["n"]
-        t = t.sort_values("cov").reset_index(drop=True)
-        vis = (k == 0)
+    # Bande 99 % (la plus large, dessinee en premier)
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([n_grille, n_grille[::-1]]),
+        y=np.concatenate([cible + b99, (cible - b99)[::-1]]),
+        fill="toself", fillcolor=COULEUR_BANDE_99, line=dict(width=0),
+        name="Entonnoir 99 %", hoverinfo="skip"))
 
-        fig.add_trace(go.Scatter(x=t["segment"], y=t["cov"], mode="lines",
-                                 line=dict(color="#2F2F2F", width=2),
-                                 showlegend=False, visible=vis, hoverinfo="skip"))
+    # Bande 95 %
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([n_grille, n_grille[::-1]]),
+        y=np.concatenate([cible + b95, (cible - b95)[::-1]]),
+        fill="toself", fillcolor=COULEUR_BANDE_95, line=dict(width=0),
+        name="Entonnoir 95 %", hoverinfo="skip"))
+
+    # Ligne cible
+    fig.add_trace(go.Scatter(
+        x=[g["n"].min(), g["n"].max()], y=[cible, cible],
+        mode="lines", line=dict(color=COULEUR_CIBLE, width=2, dash="dash"),
+        name=f"Cible {cible:.0%}", hoverinfo="skip"))
+
+    # Points -- verts (normal) et rouges (decrochage reel)
+    for masque, coul, label in [(~g["hors_entonnoir"], COULEUR_OK, "Dans l'entonnoir"),
+                                (g["hors_entonnoir"],  COULEUR_ALERTE, "Hors entonnoir (alerte)")]:
+        sub = g[masque]
+        if not len(sub): continue
         fig.add_trace(go.Scatter(
-            x=t["segment"], y=t["cov"], mode="markers+text",
-            marker=dict(size=np.clip(14 + 26*t["n"]/t["n"].max(), 14, 38),
-                        color=np.where(np.abs(t["cov"]-cible) <= 0.05, "#5CB85C", "#D9534F"),
-                        line=dict(color="#2F2F2F", width=1.5)),
-            text=[f"{v:.0%}" for v in t["cov"]], textposition="top center",
-            customdata=np.column_stack([t["n"], t["cov"]-cible]),
-            hovertemplate="<b>%{x}</b><br>Couverture : %{y:.2%}<br>"
-                          "n : %{customdata[0]:,.0f}<br>"
-                          "Ecart cible : %{customdata[1]:+.2%}<extra></extra>",
-            showlegend=False, visible=vis))
+            x=sub["n"], y=sub["cov"], mode="markers",
+            marker=dict(size=13, color=coul, line=dict(color="white", width=1.4)),
+            name=label,
+            customdata=np.column_stack([sub[segment_col], sub["ecart"]]),
+            hovertemplate=(f"<b>{segment_col} : %{{customdata[0]}}</b><br>"
+                          "Effectif : %{x:,.0f}<br>"
+                          "Couverture : %{y:.2%}<br>"
+                          "Ecart a la cible : %{customdata[1]:+.2%}<extra></extra>")))
 
-    for k, nom in enumerate(noms):
-        v = []
-        for j in range(len(noms)):
-            v.extend([j == k] * 2)
-        cov_g = variantes[nom]["couvert"].mean()
-        lg = variantes[nom]["largeur"].median()
-        boutons.append(dict(label=nom, method="update", args=[
-            {"visible": v},
-            {"title": f"{nom}<br><sub>Couverture globale {cov_g:.1%} | "
-                      f"largeur mediane {lg:,.0f} EUR</sub>"}]))
-
-    fig.add_hrect(y0=cible-0.05, y1=cible+0.05, fillcolor="#5CB85C",
-                  opacity=0.12, line_width=0)
-    fig.add_hline(y=cible, line_dash="dash", line_color="#333333", line_width=2,
-                  annotation_text=f"Cible {cible:.0%}", annotation_position="right")
     fig.update_layout(
-        title=f"{noms[0]}<br><sub>Couverture globale "
-              f"{variantes[noms[0]]['couvert'].mean():.1%}</sub>",
-        updatemenus=[dict(buttons=boutons, direction="down", x=1.0, xanchor="right",
-                          y=1.18, yanchor="top", showactive=True)],
-        yaxis=dict(title="Couverture par segment", tickformat=".0%", range=[0, 1.06]),
-        xaxis=dict(title="Segment", tickangle=-40),
-        template="plotly_white", height=620, margin=dict(t=120, b=120))
+        title=dict(text=f"Funnel plot -- couverture par {segment_col}<br>"
+                        f"<sub>{g['hors_entonnoir'].sum()} segment(s) hors entonnoir "
+                        f"sur {len(g)}</sub>", font=dict(size=16)),
+        xaxis=dict(title=f"Effectif du segment (n)", gridcolor="#e1e0d9"),
+        yaxis=dict(title="Couverture observee", tickformat=".0%",
+                  range=[0, 1.05], gridcolor="#e1e0d9"),
+        template="plotly_white", height=620, hovermode="closest",
+        legend=dict(orientation="h", y=1.10, x=0.5, xanchor="center"),
+        plot_bgcolor="#fcfcfb", paper_bgcolor="#fcfcfb")
+
+    fig.write_html(fichier or f"funnel_{segment_col}.html")
+    fig.show()
+    print(f"Sauvegarde : {fichier or f'funnel_{segment_col}.html'}")
+    return g
+
+
+# Un seul appel par variable -- aussi simple que ca
+funnel_lob  = funnel_interactif(results_test, segment_col="Lob",  alpha=ALPHA)
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np, pandas as pd
+import plotly.graph_objects as go
+from sklearn.tree import DecisionTreeClassifier
+
+COULEUR_OK, COULEUR_ATTENTION, COULEUR_ALERTE = "#0ca30c", "#fab219", "#d03b3b"
+
+
+def preparer_arbre(results, X_test, alpha=0.10, max_depth=3, min_leaf=40):
+    """Entraine l'arbre de non-couverture (identique a avant), prepare
+    les structures pour les deux graphiques interactifs."""
+    y_miss = (~results["dans_intervalle"]).astype(int).values
+    X = X_test.copy()
+    for c in X.columns:
+        if X[c].dtype == object or str(X[c].dtype) == "category":
+            X[c] = X[c].astype("category").cat.codes
+    X = X.fillna(-999)
+
+    arbre = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_leaf,
+                                   random_state=42)
+    arbre.fit(X, y_miss)
+    return arbre, X, y_miss
+
+
+def arbre_interactif(arbre, X, feature_names, alpha=0.10, fichier="arbre_interactif.html"):
+    """Arbre de non-couverture en ICICLE Plotly : cliquer sur une branche pour
+    zoomer, survoler une case pour voir la regle complete, n et couverture."""
+    t = arbre.tree_
+    ids, labels, parents, values, taux_list, regles = [], [], [], [], [], {}
+
+    def parcours(noeud, parent_id, regle_txt):
+        nid = f"n{noeud}"
+        n = int(t.n_node_samples[noeud])
+        val = t.value[noeud][0]
+        taux = val[1] / val.sum() if val.sum() else 0.0
+        regles[nid] = regle_txt
+        ids.append(nid); parents.append(parent_id); values.append(n); taux_list.append(taux)
+
+        if t.children_left[noeud] == -1:
+            labels.append(f"Feuille (n={n})")
+        else:
+            f = feature_names[t.feature[noeud]]; s = t.threshold[noeud]
+            labels.append("Racine" if parent_id == "" else regle_txt.split(" ET ")[-1])
+            gche = f"{f} <= {s:,.0f}"; dte = f"{f} > {s:,.0f}"
+            suite = "" if regle_txt == "" else regle_txt + " ET "
+            parcours(t.children_left[noeud],  nid, suite + gche)
+            parcours(t.children_right[noeud], nid, suite + dte)
+
+    parcours(0, "", "")
+    couverture = [1 - v for v in taux_list]
+
+    fig = go.Figure(go.Icicle(
+        ids=ids, labels=labels, parents=parents, values=values,
+        branchvalues="total",
+        marker=dict(colors=taux_list, colorscale=[[0, COULEUR_OK], [0.5, COULEUR_ATTENTION],
+                                                   [1, COULEUR_ALERTE]],
+                   cmin=0, cmax=max(alpha*2.5, max(taux_list)),
+                   colorbar=dict(title="Taux de<br>non-couverture", tickformat=".0%")),
+        customdata=np.column_stack([[regles[i] if regles[i] else "Racine (aucune condition)"
+                                     for i in ids], couverture]),
+        hovertemplate=("<b>Regle :</b> %{customdata[0]}<br>"
+                      "Effectif : %{value:,.0f}<br>"
+                      "Couverture : %{customdata[1]:.1%}<br>"
+                      "Non-couverture : %{color:.1%}<extra></extra>"),
+        root_color="#e1e0d9"))
+
+    fig.update_layout(
+        title=dict(text="Arbre de non-couverture (icicle interactif)<br>"
+                        "<sub>Clic pour zoomer sur une branche -- survol pour la regle</sub>",
+                   font=dict(size=16)),
+        template="plotly_white", height=560, margin=dict(t=90, l=10, r=10, b=10))
     fig.write_html(fichier); fig.show()
     print(f"Sauvegarde : {fichier}")
-
-interactif_trois_scenarios(variantes, ALPHA)
-
+    return fig
 
 
+def feuilles_interactif(arbre, X, y_miss, feature_names, alpha=0.10,
+                        fichier="feuilles_interactif.html"):
+    """Taux de non-couverture par feuille, en barres interactives.
+    Le survol affiche la regle complete qui mene a chaque feuille."""
+    t = arbre.tree_
+    chemins = {}
 
+    def parcours(noeud, conditions):
+        if t.children_left[noeud] == -1:
+            chemins[noeud] = list(conditions); return
+        f = feature_names[t.feature[noeud]]; s = t.threshold[noeud]
+        parcours(t.children_left[noeud],  conditions + [f"{f} <= {s:,.0f}"])
+        parcours(t.children_right[noeud], conditions + [f"{f} >  {s:,.0f}"])
+    parcours(0, [])
 
+    feuille_de = arbre.apply(X)
+    stats = (pd.DataFrame({"feuille": feuille_de, "manque": y_miss})
+             .groupby("feuille")["manque"].agg(taux="mean", n="size")
+             .sort_values("taux"))
+    stats["couverture"] = 1 - stats["taux"]
+    stats["regle"] = [ "<br>".join(chemins[f]) for f in stats.index ]
 
+    coul = [COULEUR_ALERTE if v > alpha*2 else COULEUR_ATTENTION if v > alpha*1.3
+            else COULEUR_OK for v in stats["taux"]]
 
+    fig = go.Figure(go.Bar(
+        y=[f"Feuille {f} (n={n})" for f, n in zip(stats.index, stats["n"])],
+        x=stats["taux"], orientation="h", marker=dict(color=coul),
+        customdata=np.column_stack([stats["couverture"], stats["regle"]]),
+        hovertemplate=("Non-couverture : %{x:.1%}<br>"
+                      "Couverture : %{customdata[0]:.1%}<br>"
+                      "<b>Regle :</b><br>%{customdata[1]}<extra></extra>")))
 
-
-
-
-
-
-def interactif_intervalles(variantes, nom="Couverture conditionnelle",
-                           max_pts=2500, fichier="cp_intervalles.html"):
-    d = variantes[nom].copy()
-    p95 = np.percentile(d["y_obs"], 95)
-    d = d[d["y_obs"] <= p95].sort_values("borne_haute").reset_index(drop=True)
-    if len(d) > max_pts:
-        d = d.iloc[np.linspace(0, len(d)-1, max_pts).astype(int)].reset_index(drop=True)
-    x = np.arange(len(d))
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=np.concatenate([x, x[::-1]]),
-        y=np.concatenate([d["borne_haute"], d["borne_basse"][::-1]]),
-        fill="toself", fillcolor="rgba(240,196,25,0.35)", line=dict(width=0),
-        name="Intervalle conforme", hoverinfo="skip"))
-    for masque, coul, lab, taille in [(d["couvert"], "#333333", "Couvert", 5),
-                                      (~d["couvert"], "#D9534F", "NON couvert", 9)]:
-        s = d[masque]
-        fig.add_trace(go.Scatter(x=x[masque.values], y=s["y_obs"], mode="markers",
-            marker=dict(size=taille, color=coul, opacity=0.75), name=lab,
-            customdata=np.column_stack([s["borne_basse"], s["borne_haute"],
-                                        s["largeur"], s["segment"]]),
-            hovertemplate="Observe : %{y:,.0f} EUR<br>"
-                          "Intervalle : [%{customdata[0]:,.0f} ; %{customdata[1]:,.0f}]<br>"
-                          "Largeur : %{customdata[2]:,.0f} EUR<br>"
-                          "Segment : %{customdata[3]}<extra></extra>"))
+    fig.add_vline(x=alpha, line_dash="dash", line_color="#0b0b0b",
+                 annotation_text=f"Taux attendu {alpha:.0%}")
     fig.update_layout(
-        title=f"{nom} -- couverture {variantes[nom]['couvert'].mean():.1%}"
-              f"<br><sub>Survol pour le detail. Zoom a la souris.</sub>",
-        xaxis=dict(title="Observations triees par borne haute", showticklabels=False),
-        yaxis=dict(title="Valeur (EUR)"),
-        template="plotly_white", height=640, hovermode="closest")
+        title=dict(text="Taux de non-couverture par feuille (interactif)<br>"
+                        f"<sub>Amplitude : {stats['taux'].max()-stats['taux'].min():.1%} -- "
+                        "survol pour la regle complete</sub>", font=dict(size=16)),
+        xaxis=dict(title="Taux de non-couverture", tickformat=".0%", gridcolor="#e1e0d9"),
+        yaxis=dict(title=""), template="plotly_white", height=520,
+        margin=dict(l=10, r=10, t=90, b=10))
     fig.write_html(fichier); fig.show()
     print(f"Sauvegarde : {fichier}")
-
-interactif_intervalles(variantes)
-
+    return stats
 
 
-
-
-
-
+# ---------- Execution ----------
+arbre, X_encode, y_miss = preparer_arbre(results_test, X_test, alpha=ALPHA)
+fig_arbre    = arbre_interactif(arbre, X_encode, list(X_test.columns), alpha=ALPHA)
+stats_feuil  = feuilles_interactif(arbre, X_encode, y_miss, list(X_test.columns), alpha=ALPHA)
 
 
 
+Le principe en une phrase
+L'arbre pose une suite de questions (« est-ce que cette variable dépasse ce seuil ? ») pour séparer les observations en groupes de plus en plus homogènes vis-à-vis de la non-couverture.
+
+La structure, nœud par nœud
+Élément	Signification
+Racine (le nœud du haut)	Toutes les observations, avant toute question
+Nœud interne	Une question : Variable ≤ seuil ?
+Branche gauche	Les observations qui répondent OUI
+Branche droite	Les observations qui répondent NON
+Feuille (bout de branche)	Un groupe final, après avoir répondu à toutes les questions du chemin
+Comment lire une feuille précise
+Sur ton arbre, pour arriver à une feuille donnée, tu suis le chemin depuis la racine en accumulant les conditions :
+
+ATR_Split_MG_FI > 58 235   ET
+Technical_losses > 233 962   ET
+IBNR_best_estimate_eop > 75 229
+    -> FEUILLE : n = 1 203, couverture = 78,1 %
+Cette feuille décrit donc : « les contrats de grande magnitude, avec de fortes pertes techniques ET une forte provision IBNR ». C'est cette phrase (pas le numéro de la feuille) qu'on met dans le mémoire.
+
+Ce que la couleur encode dans ton icicle interactif
+Vert : la feuille a un taux de non-couverture proche de l'attendu (10 %) — comportement normal
+Rouge : la feuille manque beaucoup plus que prévu — c'est une région où le modèle échoue systématiquement
+Le raisonnement qui rend l'outil utile
+Si la couverture était parfaitement conditionnelle, l'arbre ne trouverait aucune feuille différente des autres — toutes afficheraient ~10 %. Le fait qu'il ait trouvé une feuille à 0 % et une autre à 22 % prouve que la non-couverture est prévisible à partir des variables, donc que la couverture conditionnelle est violée.
 
 
 
-import plotly.express as px
 
-def interactif_heatmap(variantes, nom="Couverture conditionnelle",
-                       alpha=0.10, n_strates=5, n_min=8,
-                       fichier="cp_heatmap.html"):
-    cible = 1 - alpha
-    d = variantes[nom].copy()
-    d["strate"] = pd.qcut(d["y_obs"], n_strates,
-                          labels=[f"S{i+1}" for i in range(n_strates)], duplicates="drop")
-    g = (d.groupby(["segment","strate"], observed=True)["couvert"]
-         .agg(cov="mean", n="size").reset_index())
-    g = g[g["n"] >= n_min]
-    mat = g.pivot(index="segment", columns="strate", values="cov")
-    cnt = g.pivot(index="segment", columns="strate", values="n")
-    mat = mat.loc[mat.mean(axis=1).sort_values().index]
 
-    fig = px.imshow(mat, color_continuous_scale="RdYlGn",
-                    zmin=cible-0.25, zmax=cible+0.06, aspect="auto",
-                    labels=dict(x="Strate de magnitude", y="Segment", color="Couverture"))
-    fig.update_traces(
-        customdata=cnt.loc[mat.index].values,
-        hovertemplate="Segment : %{y}<br>Strate : %{x}<br>"
-                      "Couverture : %{z:.1%}<br>n : %{customdata:,.0f}<extra></extra>")
-    fig.update_layout(
-        title=f"{nom} -- couverture croisee segment x magnitude"
-              f"<br><sub>Rouge = sous-couverture. Cible {cible:.0%}.</sub>",
-        coloraxis_colorbar=dict(tickformat=".0%"),
-        template="plotly_white", height=680)
-    fig.write_html(fichier); fig.show()
-    print(f"Sauvegarde : {fichier}")
 
-interactif_heatmap(variantes, alpha=ALPHA)
+
+
+
+
+
+
+
+
+import numpy as np, pandas as pd
+
+def calibration_conforme_par_largeur(df_calib, y_calib, y_lo_calib, y_hi_calib,
+                                     df_test, y_lo_test, y_hi_test,
+                                     n_bins=10, alpha=0.10, n_min_bin=30):
+    """Mondrian conditionne sur la largeur BRUTE de l'intervalle (q95-q05),
+    suivant exactement les 5 etapes du tuteur."""
+
+    # ---------- ETAPE 1 : largeur individuelle, SANS conformalisation ----------
+    largeur_calib = y_hi_calib - y_lo_calib
+    largeur_test  = y_hi_test  - y_lo_test
+
+    # ---------- ETAPE 2 : bins definis sur la CALIBRATION uniquement ----------
+    bornes = np.unique(np.quantile(largeur_calib, np.linspace(0, 1, n_bins + 1)))
+    bornes[0], bornes[-1] = -np.inf, np.inf     # capture toute valeur extreme du test
+    n_bins_reel = len(bornes) - 1
+
+    groupe_calib = pd.cut(largeur_calib, bins=bornes, labels=False, include_lowest=True)
+    groupe_test  = pd.cut(largeur_test,  bins=bornes, labels=False, include_lowest=True)
+
+    # ---------- ETAPE 3 : Qhat par groupe ----------
+    scores_calib = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib)
+    q_global = float(np.quantile(scores_calib,
+                     min(np.ceil((len(scores_calib)+1)*(1-alpha))/len(scores_calib), 1.0),
+                     method="higher"))
+
+    lignes = []
+    for g in range(n_bins_reel):
+        m = groupe_calib == g
+        n_g = int(m.sum())
+        if n_g < n_min_bin:
+            q_g, statut = q_global, "repli global (n trop faible)"
+        else:
+            niveau = min(np.ceil((n_g + 1) * (1 - alpha)) / n_g, 1.0)
+            q_g = float(np.quantile(scores_calib[m], niveau, method="higher"))
+            statut = "propre"
+        lignes.append({"groupe": g, "largeur_min": bornes[g], "largeur_max": bornes[g+1],
+                       "n_calib": n_g, "Qhat": q_g, "statut": statut})
+    table_qhat = pd.DataFrame(lignes)
+
+    print("=" * 78); print("  TABLE DES Qhat PAR GROUPE DE LARGEUR (etape 3)"); print("=" * 78)
+    print(table_qhat.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
+    monotone = table_qhat["Qhat"].is_monotonic_increasing
+    print(f"\n  Qhat croissant avec la largeur : {'OUI (coherent)' if monotone else 'NON -> a verifier'}")
+
+    # ---------- ETAPE 4 : jointure sur le tableau individuel ----------
+    map_qhat = table_qhat.set_index("groupe")["Qhat"]
+    qhat_calib_ind = map_qhat.reindex(groupe_calib).values
+    qhat_test_ind  = map_qhat.reindex(groupe_test).values
+
+    # ---------- ETAPE 5 : bornes finales ----------
+    lower_calib = np.clip(y_lo_calib - qhat_calib_ind, 0, None)
+    upper_calib = y_hi_calib + qhat_calib_ind
+    lower_test  = np.clip(y_lo_test  - qhat_test_ind,  0, None)
+    upper_test  = y_hi_test  + qhat_test_ind
+
+    return {"table_qhat": table_qhat, "bornes": bornes,
+            "test": {"lower": lower_test, "upper": upper_test, "groupe": groupe_test},
+            "calib": {"lower": lower_calib, "upper": upper_calib, "groupe": groupe_calib}}
+
+
+res = calibration_conforme_par_largeur(
+    df_calib, y_calib.values, y_lo_calib, y_hi_calib,
+    df_test, y_lo_test, y_hi_test, n_bins=10, alpha=ALPHA)
+
+
+
+
+
+
+
+
+
+
+    results_v2 = results_test.copy()
+results_v2["borne_basse"]  = res["test"]["lower"]
+results_v2["borne_haute"]  = res["test"]["upper"]
+results_v2["largeur_intervalle"] = results_v2["borne_haute"] - results_v2["borne_basse"]
+results_v2["groupe_largeur"] = res["test"]["groupe"]
+results_v2["dans_intervalle"] = ((results_v2["y_obs"] >= results_v2["borne_basse"]) &
+                                 (results_v2["y_obs"] <= results_v2["borne_haute"]))
+
+print(f"Couverture globale : {results_v2['dans_intervalle'].mean():.2%}  (cible {1-ALPHA:.0%})")
+
+
+
+
+
+
+
+
+
+
+verif = (results_v2.groupby("groupe_largeur")["dans_intervalle"]
+         .agg(n="size", couverture="mean").reset_index())
+verif["ecart_cible"] = verif["couverture"] - (1 - ALPHA)
+print(verif.to_string(index=False, float_format=lambda v: f"{v:,.4f}"))
+print(f"\nAmplitude de couverture entre groupes : "
+      f"{verif['couverture'].max() - verif['couverture'].min():.2%}")
+print("-> Compare a l'amplitude de 22 points trouvee par l'arbre : si elle a")
+print("   nettement diminue, l'approche du tuteur corrige bien le probleme.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(11, 6))
+x = verif["groupe_largeur"]
+coul = ["#d03b3b" if abs(e) > 0.05 else "#0ca30c" for e in verif["ecart_cible"]]
+ax.bar(x, verif["couverture"], color=coul)
+ax.axhline(1 - ALPHA, color="black", ls="--", lw=2, label=f"Cible {1-ALPHA:.0%}")
+ax.set_xlabel("Groupe de largeur (0 = intervalles etroits, 9 = intervalles larges)")
+ax.set_ylabel("Couverture observee")
+ax.set_title("Couverture par groupe apres Mondrian sur la largeur brute")
+ax.legend()
+for i, (c, n) in enumerate(zip(verif["couverture"], verif["n"])):
+    ax.text(i, c, f"{c:.0%}\nn={n}", ha="center", va="bottom", fontsize=8)
+plt.tight_layout(); plt.savefig("mondrian_largeur.png", dpi=200); plt.show()
