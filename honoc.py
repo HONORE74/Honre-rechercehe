@@ -1,14 +1,90 @@
-Ton modèle ne se contente pas de donner un chiffre pour chaque contrat — il donne aussi une fourchette autour de ce chiffre, en promettant : « dans 90 % des cas, la vraie valeur tombera dans cette fourchette. » C'est une promesse de fiabilité, pas juste une estimation.
+import numpy as np, pandas as pd
 
-La première fois qu'on a vérifié cette promesse, elle semblait tenue : en moyenne, sur l'ensemble du portefeuille, on tombait bien autour de 90 %. Mais une moyenne, ça peut mentir par omission. Imagine un médecin qui annonce « mon traitement réussit dans 90 % des cas », alors qu'en réalité il réussit à 100 % chez les patients jeunes et seulement à 78 % chez les patients âgés. La moyenne des deux donne bien quelque chose proche de 90 %, mais elle cache que le traitement est beaucoup moins fiable pour une partie précise des patients — justement ceux qui en avaient le plus besoin.
+def conformal_par_largeur(df_calib, y_calib, y_lo_calib, y_hi_calib,
+                          df_test, y_lo_test, y_hi_test, y_test,
+                          n_bins=10, alpha=0.10, n_min_bin=30):
+    """Les 5 etapes de la methode du tuteur, avec jointure explicite."""
 
-C'est exactement ce que l'arbre a découvert dans ton portefeuille. Il a cherché, tout seul, sans qu'on lui dise où regarder, s'il existait une catégorie de contrats où la promesse des 90 % ne tenait pas. Et il en a trouvé une : les contrats les plus lourds financièrement n'étaient couverts correctement que dans 78 % des cas, alors que d'autres contrats l'étaient à 100 %. L'écart entre le meilleur et le pire groupe — ce qu'on appelle l'amplitude — était de 22 points. Vingt-deux points, c'est énorme : ça veut dire que la promesse de fiabilité n'était pas du tout la même partout, et qu'elle était la plus fragile précisément là où l'enjeu financier est le plus grand.
+    # ---------- ETAPE 1 : largeur brute, sans conformalisation ----------
+    largeur_calib = y_hi_calib - y_lo_calib
+    largeur_test  = y_hi_test  - y_lo_test
 
-Ton tuteur a alors proposé une correction. Plutôt que d'essayer de deviner à la main quelle catégorie de contrats (la branche d'activité, le type de risque…) était responsable du problème, il a proposé de laisser le modèle lui-même dire où il est sûr de lui et où il ne l'est pas — en regardant la largeur de fourchette qu'il produit naturellement pour chaque contrat. Un contrat pour lequel le modèle sort une fourchette étroite, c'est un contrat qu'il pense bien maîtriser. Un contrat avec une fourchette large, c'est un contrat qu'il sait risqué. L'idée a été de regrouper les contrats non plus par branche d'activité, mais par ce niveau de confiance que le modèle affiche lui-même, et d'ajuster la correction séparément pour chaque niveau de confiance.
+    # ---------- ETAPE 2 : bornes des groupes, definies sur la CALIBRATION ----------
+    bornes = np.unique(np.quantile(largeur_calib, np.linspace(0, 1, n_bins + 1)))
+    bornes[0], bornes[-1] = -np.inf, np.inf     # capture toute valeur extreme du test
+    n_reel = len(bornes) - 1
 
-Résultat : quand on a refait la même vérification après cette correction, l'écart entre le meilleur et le pire groupe est tombé à 5,68 points. Autrement dit, la promesse des 90 % est désormais respectée de façon beaucoup plus homogène sur tout le portefeuille — qu'un contrat soit petit ou énorme, simple ou compliqué, la fiabilité annoncée est presque la même partout, alors qu'avant elle s'effondrait sur les gros contrats.
+    # <<< C'EST ICI que chaque ligne recoit son id_groupe >>>
+    id_groupe_calib = pd.cut(largeur_calib, bins=bornes, labels=False, include_lowest=True)
+    id_groupe_test  = pd.cut(largeur_test,  bins=bornes, labels=False, include_lowest=True)
 
-Ce qui s'est amélioré, ce n'est donc pas la précision du modèle lui-même — c'est l'équité de sa fiabilité. Avant, le modèle tenait sa promesse de façon très inégale selon les contrats. Après la correction, il la tient de façon beaucoup plus égale pour tout le monde. Et ce n'est pas tombé à zéro d'écart, ce qui est normal et même attendu : aucune méthode ne peut garantir une fiabilité parfaitement identique dans absolument toutes les situations — c'est un résultat théorique connu, pas une faiblesse de ta méthode. Ce qui compte, c'est que l'écart soit passé d'énorme (22) à faible (5,68) : c'est la preuve chiffrée que la correction proposée par ton tuteur a résolu, en grande partie, le vrai problème.
+    # ---------- ETAPE 3 : un Q_hat par groupe ----------
+    scores = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib)
+    n_tot  = len(scores)
+    q_global = float(np.quantile(scores,
+                     min(np.ceil((n_tot+1)*(1-alpha))/n_tot, 1.0), method="higher"))
+
+    lignes = []
+    for g in range(n_reel):
+        m = id_groupe_calib == g
+        n_g = int(m.sum())
+        if n_g < n_min_bin:
+            q_g, statut = q_global, "repli global"
+        else:
+            niveau = min(np.ceil((n_g + 1) * (1 - alpha)) / n_g, 1.0)
+            q_g, statut = float(np.quantile(scores[m], niveau, method="higher")), "propre"
+        lignes.append({"id_groupe": g,
+                       "largeur_min": bornes[g], "largeur_max": bornes[g+1],
+                       "n_calib": n_g, "Q_hat": q_g, "statut": statut})
+    table_qhat = pd.DataFrame(lignes)
+
+    print("=" * 88); print("  ETAPE 3 -- UN Q_hat PAR GROUPE"); print("=" * 88)
+    print(table_qhat.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
+    print(f"\n  Q_hat global (reference) : {q_global:,.2f}")
+    print(f"  Rapport max/min entre groupes : "
+          f"{table_qhat['Q_hat'].max()/max(table_qhat['Q_hat'].min(), 1e-9):,.1f}x")
+
+    # ---------- ETAPE 4 : JOINTURE ----------
+    res = pd.DataFrame({"id_groupe": id_groupe_test,
+                        "y_obs": np.asarray(y_test, float),
+                        "q05": y_lo_test, "q95": y_hi_test,
+                        "largeur_brute": largeur_test})
+    n_avant = len(res)
+    res = res.merge(table_qhat[["id_groupe", "Q_hat"]], on="id_groupe",
+                    how="left", validate="many_to_one")
+
+    print(f"\n  ETAPE 4 -- JOINTURE")
+    print(f"    Lignes avant / apres : {n_avant:,} / {len(res):,}  "
+          f"{'OK' if len(res)==n_avant else 'DUPLICATION !'}")
+    print(f"    Lignes sans Q_hat    : {res['Q_hat'].isna().sum():,}")
+    print(f"    Q_hat distincts      : {res['Q_hat'].nunique()}")
+
+    # ---------- ETAPE 5 : bornes finales avec le Q_hat INDIVIDUEL ----------
+    res["borne_basse"] = np.clip(res["q05"] - res["Q_hat"], 0, None)
+    res["borne_haute"] = res["q95"] + res["Q_hat"]
+    res["largeur_finale"] = res["borne_haute"] - res["borne_basse"]
+    res["dans_intervalle"] = ((res["y_obs"] >= res["borne_basse"]) &
+                              (res["y_obs"] <= res["borne_haute"]))
+
+    verif = (res.groupby("id_groupe")
+             .agg(n=("y_obs","size"), Q_hat=("Q_hat","first"),
+                  couverture=("dans_intervalle","mean"),
+                  largeur_brute_med=("largeur_brute","median"),
+                  largeur_finale_med=("largeur_finale","median")).reset_index())
+    verif["ecart_cible"] = verif["couverture"] - (1 - alpha)
+
+    print("\n" + "=" * 88); print("  VERIFICATION PAR GROUPE"); print("=" * 88)
+    print(verif.to_string(index=False, float_format=lambda v: f"{v:,.4f}"))
+    print(f"\n  Couverture globale      : {res['dans_intervalle'].mean():.2%}  (cible {1-alpha:.0%})")
+    print(f"  Amplitude entre groupes : {verif['couverture'].max()-verif['couverture'].min():.2%}")
+    print("=" * 88)
+    return res, table_qhat, bornes, verif, q_global
+
+
+resultats, table_qhat, bornes, verif, q_global = conformal_par_largeur(
+    df_calib, y_calib.values, y_lo_calib, y_hi_calib,
+    df_test, y_lo_test, y_hi_test, y_test.values,
+    n_bins=10, alpha=ALPHA)
 
 
 
@@ -25,22 +101,111 @@ Ce qui s'est amélioré, ce n'est donc pas la précision du modèle lui-même �
 
 
 
-Bonne question — c'est le moment où on passe du diagnostic à l'usage. Voici comment je vois la suite, sans plonger dans le code.
 
-Ce résultat, il faut le figer, pas le poursuivre indéfiniment
-Tu n'as pas besoin de chercher à réduire encore l'écart de 5,68 points vers zéro. Deux raisons à ça. D'abord, on l'a vu : la fiabilité parfaitement identique partout est mathématiquement impossible à garantir, donc viser zéro serait courir après quelque chose d'inatteignable. Ensuite, si tu continues à découper en groupes de plus en plus fins pour chasser ce dernier écart, tu vas te retrouver avec des groupes qui contiennent trop peu d'observations pour que le calcul soit fiable — et tu risques d'introduire de l'instabilité au lieu de la corriger. Un écart de 5 à 10 points est considéré comme un bon résultat pratique : c'est le moment de s'arrêter et de verrouiller cette méthode comme étant ta version définitive.
 
-Ce que ça change concrètement dans la façon de faire
-Jusqu'ici, tu appliquais une seule correction, la même pour tout le monde. Désormais, la règle change : chaque nouveau contrat qui arrive doit d'abord être classé selon le niveau de confiance que le modèle affiche pour lui — sa fourchette est-elle étroite ou large — puis recevoir la correction propre à ce niveau de confiance, et non plus une correction unique. C'est comme si, au lieu d'appliquer la même marge d'erreur à tout le portefeuille, tu appliquais une marge adaptée à chaque profil de risque. Ce découpage par niveau de confiance (les bornes des groupes, et la correction associée à chacun) doit être conservé tel quel : ce sont des paramètres appris une fois sur ta période de calibration, à ne plus recalculer à chaque nouveau trimestre, sinon tu perds la cohérence de la méthode dans le temps.
 
-Là où ça devient réellement utile : la détection d'anomalies
-C'est le cœur de ton mémoire, et c'est maintenant que ce travail prend tout son sens. Avant la correction, les gros contrats sortaient de leur fourchette 22 % du temps au lieu des 10 % promis. Ce n'est pas parce qu'ils étaient réellement plus souvent anormaux — c'est parce que leur fourchette était artificiellement trop étroite. Résultat : ton système aurait signalé beaucoup trop de « fausses alertes » sur les gros contrats, simplement parce que la méthode était mal calibrée pour eux, pas parce qu'il s'y passait quelque chose d'anormal. Un actuaire qui aurait suivi ces alertes aurait perdu du temps à vérifier des dossiers qui n'avaient en réalité rien de suspect.
 
-Maintenant que la fiabilité est homogène partout, un contrat qui sort de sa fourchette a beaucoup plus de chances d'être une vraie anomalie, quelle que soit sa taille. Le système de priorisation qu'on avait construit plus tôt (sévérité, matérialité financière, confiance du modèle) devient alors réellement exploitable, parce qu'il repose sur une base de comparaison juste : le taux d'alerte attendu de 10 % est désormais respecté aussi bien sur les petits que sur les gros contrats, donc les alertes qui remontent sont des signaux réels, pas des artefacts de calibration.
 
-Ce qu'il te reste à faire, dans l'ordre
-Vérifier que ça tient dans le temps : refaire ce même contrôle sur une autre période (un autre trimestre), pour t'assurer que le résultat de 5,68 n'est pas propre à ce découpage précis mais se maintient si les données changent un peu.
-Documenter la méthode comme définitive : dans ton mémoire, présente le problème (22 points, découvert par l'arbre), la solution de ton tuteur (correction par niveau de confiance), et le résultat (5,68 points) comme le résultat central de ce chapitre.
-Brancher la détection d'anomalies dessus : reprends le système de priorisation en l'appliquant sur ces fourchettes corrigées plutôt que sur les anciennes — c'est ce qui donnera des alertes fiables et équitables.
-Ne plus retoucher la correction à chaque nouveau trimestre : elle doit rester stable pour que la comparaison dans le temps ait un sens.
-En une phrase : tu passes d'une phase de diagnostic et de correction à une phase d'exploitation — la méthode est validée, il s'agit maintenant de t'en servir pour ce pour quoi elle a été construite, détecter les vraies anomalies du portefeuille.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+
+COULEUR_OK, COULEUR_ALERTE = "#0ca30c", "#d03b3b"
+COULEUR_PRIM, COULEUR_ACC  = "#2a78d6", "#eb6834"
+COULEUR_INK, COULEUR_GRILLE = "#0b0b0b", "#e1e0d9"
+
+
+def visualiser_conformal_groupe(resultats, table_qhat, verif, calib_scores,
+                                q_global, alpha=0.10, fichier="conformal_par_groupe.png"):
+    cible = 1 - alpha
+    fig, ax = plt.subplots(2, 2, figsize=(16, 11))
+
+    # ---- (1) Scores conformes avec TOUS les Q_hat, un par groupe ----
+    p99 = np.percentile(calib_scores, 99)
+    ax[0,0].hist(calib_scores[calib_scores <= p99], bins=50, color=COULEUR_PRIM,
+                 alpha=0.6, edgecolor="white", density=True)
+    palette = plt.cm.viridis(np.linspace(0, 0.9, len(table_qhat)))
+    for (_, r), c in zip(table_qhat.iterrows(), palette):
+        if r["Q_hat"] <= p99:
+            ax[0,0].axvline(r["Q_hat"], color=c, lw=1.8, alpha=0.85)
+    ax[0,0].axvline(q_global, color=COULEUR_ACC, ls="--", lw=2.6,
+                    label=f"Q_hat global = {q_global:,.0f}")
+    ax[0,0].set_xlabel("Score conforme (calibration)")
+    ax[0,0].set_ylabel("Densite")
+    ax[0,0].set_title(f"1. Un seuil par groupe, au lieu d'un seul\n"
+                      f"{len(table_qhat)} lignes colorees = les {len(table_qhat)} Q_hat",
+                      fontsize=11, fontweight="bold")
+    ax[0,0].legend(fontsize=9)
+
+    # ---- (2) Q_hat en fonction du groupe : la correction croit-elle ? ----
+    ax[0,1].plot(table_qhat["id_groupe"], table_qhat["Q_hat"], marker="o",
+                 color=COULEUR_PRIM, lw=2.2, markersize=9, label="Q_hat par groupe")
+    ax[0,1].axhline(q_global, color=COULEUR_ACC, ls="--", lw=2,
+                    label=f"Q_hat global = {q_global:,.0f}")
+    ax[0,1].fill_between(table_qhat["id_groupe"], 0, table_qhat["Q_hat"],
+                         color=COULEUR_PRIM, alpha=0.12)
+    ax[0,1].set_xlabel("Groupe (0 = fourchettes etroites -> 9 = fourchettes larges)")
+    ax[0,1].set_ylabel("Q_hat (correction appliquee)")
+    ax[0,1].set_title("2. La correction s'adapte-t-elle a la difficulte ?\n"
+                      "Une courbe croissante = comportement attendu",
+                      fontsize=11, fontweight="bold")
+    ax[0,1].legend(fontsize=9)
+    for _, r in table_qhat.iterrows():
+        ax[0,1].annotate(f"{r['Q_hat']:,.0f}", (r["id_groupe"], r["Q_hat"]),
+                         fontsize=7, xytext=(0, 7), textcoords="offset points",
+                         ha="center")
+
+    # ---- (3) Couverture par groupe : le test qui valide la methode ----
+    coul = [COULEUR_ALERTE if abs(e) > 0.05 else COULEUR_OK for e in verif["ecart_cible"]]
+    ax[1,0].bar(verif["id_groupe"], verif["couverture"], color=coul)
+    ax[1,0].axhline(cible, color=COULEUR_INK, ls="--", lw=2, label=f"Cible {cible:.0%}")
+    ax[1,0].axhspan(cible-0.05, cible+0.05, color=COULEUR_OK, alpha=0.10,
+                    label="Tolerance +/- 5 pts")
+    ax[1,0].set_xlabel("Groupe"); ax[1,0].set_ylabel("Couverture observee")
+    ax[1,0].set_ylim(0, 1.05)
+    amp = verif["couverture"].max() - verif["couverture"].min()
+    ax[1,0].set_title(f"3. Couverture par groupe -- amplitude {amp:.2%}\n"
+                      "Toutes les barres proches de la ligne = methode reussie",
+                      fontsize=11, fontweight="bold")
+    ax[1,0].legend(fontsize=9)
+    for _, r in verif.iterrows():
+        ax[1,0].text(r["id_groupe"], r["couverture"],
+                     f"{r['couverture']:.0%}\nn={int(r['n'])}",
+                     ha="center", va="bottom", fontsize=7)
+
+    # ---- (4) Largeur avant / apres correction, par groupe ----
+    x = verif["id_groupe"]; w = 0.38
+    ax[1,1].bar(x - w/2, verif["largeur_brute_med"], w, color="#9ec5f4",
+                label="Avant correction (q95 - q05)")
+    ax[1,1].bar(x + w/2, verif["largeur_finale_med"], w, color=COULEUR_PRIM,
+                label="Apres correction")
+    ax[1,1].set_xlabel("Groupe"); ax[1,1].set_ylabel("Largeur mediane")
+    ax[1,1].set_title("4. Le prix a payer : elargissement par groupe\n"
+                      "L'ecart montre ou la correction agit le plus",
+                      fontsize=11, fontweight="bold")
+    ax[1,1].legend(fontsize=9)
+
+    for a in ax.ravel():
+        a.grid(axis="y", ls=":", alpha=0.4, color=COULEUR_GRILLE)
+        a.set_axisbelow(True)
+        for s in ("top","right"): a.spines[s].set_visible(False)
+
+    plt.tight_layout(); plt.savefig(fichier, dpi=220, bbox_inches="tight"); plt.show()
+
+    print(f"\n  Elargissement median global : "
+          f"{(verif['largeur_finale_med']/verif['largeur_brute_med']).median():.2f}x")
+
+
+visualiser_conformal_groupe(resultats, table_qhat, verif, calib_scores, q_global, ALPHA)
