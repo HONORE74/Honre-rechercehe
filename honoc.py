@@ -1,22 +1,68 @@
-# D'ou vient le pic du groupe 8 ?
-scores_calib = np.maximum(y_lo_calib - y_calib.values, y_calib.values - y_hi_calib)
-id_g_calib = pd.cut(y_hi_calib - y_lo_calib, bins=bornes, labels=False, include_lowest=True)
+def conformal_score_normalise(y_calib, y_lo_calib, y_hi_calib,
+                              y_lo_test, y_hi_test, y_test,
+                              n_bins=5, alpha=0.10, n_min_bin=100, par_groupe=True):
+    """Score RELATIF : l'ecart est divise par la largeur de l'intervalle.
+    Le Q_hat devient un MULTIPLICATEUR, pas une constante en euros."""
+    larg_calib = np.maximum(y_hi_calib - y_lo_calib, 1e-6)
+    larg_test  = np.maximum(y_hi_test  - y_lo_test,  1e-6)
 
-print(f"{'groupe':>7}{'n':>7}{'med':>12}{'p75':>12}{'p90':>12}{'p95':>12}{'max':>14}")
-for g in sorted(pd.Series(id_g_calib).dropna().unique()):
-    s = scores_calib[id_g_calib == g]
-    print(f"{int(g):>7}{len(s):>7}{np.median(s):>12,.0f}{np.percentile(s,75):>12,.0f}"
-          f"{np.percentile(s,90):>12,.0f}{np.percentile(s,95):>12,.0f}{s.max():>14,.0f}")
+    # Score normalise : sans unite, comparable entre petits et gros contrats
+    scores = np.maximum(y_lo_calib - y_calib, y_calib - y_hi_calib) / larg_calib
 
-# Le groupe 8 est-il pilote par quelques valeurs extremes ?
-s8 = scores_calib[id_g_calib == 8]
-print(f"\nGroupe 8 : n={len(s8)}")
-print(f"  10 plus grands scores : {np.sort(s8)[-10:].round(0)}")
-print(f"  Q_hat sans les 5 plus extremes : "
-      f"{np.percentile(np.sort(s8)[:-5], 90):,.0f}")
+    def qhat(s, a=alpha):
+        n = len(s)
+        return float(np.quantile(s, min(np.ceil((n+1)*(1-a))/n, 1.0), method="higher"))
+
+    q_glob = qhat(scores)
+    print(f"Q_hat global normalise : {q_glob:.4f}  "
+          f"(= elargissement de {q_glob*100:.1f} % de la largeur de chaque intervalle)")
+
+    if not par_groupe:
+        lo = np.clip(y_lo_test - q_glob*larg_test, 0, None)
+        hi = y_hi_test + q_glob*larg_test
+        table = None
+    else:
+        bornes = np.unique(np.quantile(larg_calib, np.linspace(0, 1, n_bins+1)))
+        bornes[0], bornes[-1] = -np.inf, np.inf
+        gc = pd.cut(larg_calib, bins=bornes, labels=False, include_lowest=True)
+        gt = pd.cut(larg_test,  bins=bornes, labels=False, include_lowest=True)
+
+        lignes = []
+        for g in range(len(bornes)-1):
+            m = gc == g; n_g = int(m.sum())
+            q_g = q_glob if n_g < n_min_bin else qhat(scores[m])
+            lignes.append({"id_groupe": g, "n_calib": n_g, "Q_hat_norm": q_g})
+        table = pd.DataFrame(lignes)
+        print("\n", table.to_string(index=False, float_format=lambda v: f"{v:,.4f}"))
+
+        q_ind = table.set_index("id_groupe")["Q_hat_norm"].reindex(gt).values
+        lo = np.clip(y_lo_test - q_ind*larg_test, 0, None)
+        hi = y_hi_test + q_ind*larg_test
+
+    res = pd.DataFrame({"y_obs": np.asarray(y_test, float),
+                        "borne_basse": lo, "borne_haute": hi,
+                        "largeur_finale": hi - lo,
+                        "id_groupe": (gt if par_groupe else 0)})
+    res["dans_intervalle"] = (res["y_obs"] >= res["borne_basse"]) & (res["y_obs"] <= res["borne_haute"])
+    return res, table
 
 
-
+# --- Comparaison des trois approches ---
+for nom, params in [("Score ABSOLU, 10 groupes",   dict(n_bins=10, par_groupe=True)),
+                    ("Score NORMALISE, global",     dict(par_groupe=False)),
+                    ("Score NORMALISE, 5 groupes",  dict(n_bins=5,  par_groupe=True))]:
+    print("\n" + "="*70); print(f"  {nom}"); print("="*70)
+    if "ABSOLU" in nom:
+        r, v = resultats, verif
+        cov, amp = r["dans_intervalle"].mean(), v["couverture"].max()-v["couverture"].min()
+        larg = r["largeur_finale"].median()
+    else:
+        r, _ = conformal_score_normalise(y_calib.values, y_lo_calib, y_hi_calib,
+                                         y_lo_test, y_hi_test, y_test.values,
+                                         alpha=ALPHA, **params)
+        g = r.groupby("id_groupe")["dans_intervalle"].mean()
+        cov, amp, larg = r["dans_intervalle"].mean(), g.max()-g.min(), r["largeur_finale"].median()
+    print(f"  Couverture : {cov:.2%}   Amplitude : {amp:.2%}   Largeur mediane : {larg:,.0f}")
 
 
 
