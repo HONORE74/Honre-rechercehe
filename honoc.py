@@ -1,307 +1,36 @@
-Tou premeir 
-
-# =========================================================================
-# BANDE CONFORME — style reference (y_pred en abscisse)
-#   Ligne noire = droite y = x (la prediction, par construction)
-#   Bande       = [borne_basse ; borne_haute]
-#   Points      : vert = dans l'intervalle / rouge = hors intervalle
-# =========================================================================
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import ipywidgets as widgets
-from IPython.display import display, clear_output
-
-N_MAX    = 90      # observations affichees (reduit pour une figure lisible)
-LISSAGE  = 0       # 0 = bornes brutes (exact). 5-11 = mediane glissante (voir note)
-LOG_AXES = True    # log-log : recommande pour des montants a queue lourde
-
-
-def bande_style_reference(df, niveau=None, groupe_col="groupe_largeur",
-                          n_max=N_MAX, lissage=LISSAGE, log_axes=LOG_AXES,
-                          random_state=42, out=None):
-    d = df if (niveau in (None, "TOUS")) else df[df[groupe_col] == niveau]
-    d = d.copy()
-    if len(d) < 5:
-        print(f"Niveau '{niveau}' : {len(d)} observations, trop peu.")
-        return
-    if len(d) > n_max:
-        d = d.sample(n_max, random_state=random_state)
-
-    d = d.sort_values("y_pred").reset_index(drop=True)
-    xs = d["y_pred"].values.astype(float)
-    lo = d["borne_basse"].values.astype(float).copy()
-    hi = d["borne_haute"].values.astype(float).copy()
-    obs = d["y_obs"].values.astype(float)
-    dedans = d["dans_intervalle"].values.astype(bool)
-
-    # Lissage optionnel : rend l'enveloppe plus reguliere, mais un point rouge
-    # peut alors sembler tomber dans la bande. Le statut vert/rouge reste
-    # calcule sur les bornes REELLES, jamais sur les bornes lissees.
-    if lissage and lissage >= 3:
-        w = int(lissage)
-        lo = pd.Series(lo).rolling(w, center=True, min_periods=1).median().values
-        hi = pd.Series(hi).rolling(w, center=True, min_periods=1).median().values
-
-    log_ok = log_axes and (xs > 0).all() and (obs > 0).all()
-    if log_ok:
-        lo = np.maximum(lo, np.nanmin(obs[obs > 0]) * 1e-2)
-
-    hover = [(f"<b>{' | '.join(str(r[c]) for c in ID_COLS if c in d.columns)}</b><br>"
-              f"Observe   : {r['y_obs']:,.0f}<br>"
-              f"Predit    : {r['y_pred']:,.0f}<br>"
-              f"Intervalle: [{r['borne_basse']:,.0f} ; {r['borne_haute']:,.0f}]")
-             for _, r in d.iterrows()]
-
-    fig = go.Figure()
-
-    # Bande conforme
-    fig.add_trace(go.Scatter(x=xs, y=lo, mode="lines",
-                              line=dict(color="#7b7fd6", width=1.3, dash="dot"),
-                              showlegend=False, hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=xs, y=hi, mode="lines",
-                              line=dict(color="#7b7fd6", width=1.3, dash="dot"),
-                              fill="tonexty", fillcolor="rgba(150,150,235,0.35)",
-                              name=f"Prediction Interval ({100*(1-ALPHA):.0f} %)",
-                              hoverinfo="skip"))
-
-    # Droite de prediction : y = x, exactement comme la droite noire de reference
-    fig.add_trace(go.Scatter(x=[xs.min(), xs.max()], y=[xs.min(), xs.max()],
-                              mode="lines", line=dict(color="black", width=2),
-                              name="Prediction", hoverinfo="skip"))
-
-    # Observations
-    fig.add_trace(go.Scatter(
-        x=xs[dedans], y=obs[dedans], mode="markers",
-        marker=dict(size=6, color="#1b7f2c"),
-        name=f"Observation (inside PI) — {dedans.sum()}",
-        text=[h for h, k in zip(hover, dedans) if k],
-        hovertemplate="%{text}<extra></extra>"))
-    fig.add_trace(go.Scatter(
-        x=xs[~dedans], y=obs[~dedans], mode="markers",
-        marker=dict(size=7, color="#e02020"),
-        name=f"Observation (outside PI) — {(~dedans).sum()}",
-        text=[h for h, k in zip(hover, dedans) if not k],
-        hovertemplate="%{text}<extra></extra>"))
-
-    titre = f"Intervalle de Conformal Prediction — {len(d)} observations"
-    if niveau not in (None, "TOUS"):
-        titre += f"  |  niveau : {niveau}"
-    fig.update_layout(
-        title=titre,
-        xaxis=dict(title="Prediction du modele" + ("  (log)" if log_ok else ""),
-                   type="log" if log_ok else "linear"),
-        yaxis=dict(title=f"{TARGET} observe" + ("  (log)" if log_ok else ""),
-                   type="log" if log_ok else "linear"),
-        template="plotly_white", height=620, hovermode="closest",
-        legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.85)",
-                    bordercolor="black", borderwidth=1))
-
-    if out is not None:
-        with out:
-            clear_output(wait=True)
-            fig.show()
-    else:
-        fig.show()
-
-
-niveaux = ["TOUS"] + (results_v2["groupe_largeur"].value_counts()
-                      .loc[lambda s: s >= 10].index.tolist()
-                      if "groupe_largeur" in results_v2.columns else [])
-
-out = widgets.Output()
-dd = widgets.Dropdown(options=niveaux, description="Niveau :",
-                      layout=widgets.Layout(width="500px"))
-dd.observe(lambda ch: bande_style_reference(results_v2, ch["new"], out=out)
-          if ch["name"] == "value" else None, names="value")
-display(dd, out)
-bande_style_reference(results_v2, "TOUS", out=out)
-
-
-
-
-Deuxièmeme
-
 # ================================================================
-# CONFORMAL PREDICTION PAR CATEGORIE — bornes individuelles exactes
+# CONFORMAL PREDICTION — VISUALISATION CONTINUE DES INTERVALLES CP
 #
-# X : categorie (Lob / Risk / Partner / ...) — 5 modalites principales
-# Y : RBNS_eop observe
+# DataFrame : anomalies_prio
 #
-# Dans chaque categorie, les observations sont ordonnees par prediction
-# croissante et etalees sur la largeur du slot. Le ruban trace est fait
-# des VRAIES bornes CP individuelles : aucune mediane, aucun lissage.
-# Un point rouge est donc necessairement hors du ruban a son abscisse.
+# AXE X :
+#   Rang de priorité des anomalies
+#   (score de priorisation décroissant)
+#
+# AXE Y :
+#   RBNS_eop observé
+#
+# BANDE :
+#   borne_basse  -> borne_haute
+#   propre à chaque observation
+#
+# LIGNE NOIRE :
+#   prédiction
+#
+# POINTS :
+#   bleu  = observation dans son intervalle CP
+#   rouge = observation hors de son intervalle CP
+#
+# IMPORTANT :
+#   - aucun max/min global
+#   - aucune médiane
+#   - aucune régression artificielle
+#   - aucun intervalle constant
 # ================================================================
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import ipywidgets as widgets
-from IPython.display import display, clear_output
-
-OBS_COL    = "y_obs"
-PRED_COL   = "y_pred"
-LOWER_COL  = "borne_basse"
-UPPER_COL  = "borne_haute"
-INSIDE_COL = "dans_intervalle"
-
-N_CATEGORIES  = 5
-N_POINTS_CAT  = 35
-DEMI_LARGEUR  = 0.38     # demi-largeur d'un slot de categorie
-POINT_SIZE    = 5
-
-
-def plot_cp_par_categorie(df, category_col, n_categories=N_CATEGORIES,
-                          n_points=N_POINTS_CAT, log_y=True,
-                          random_state=42, out=None):
-    d = df.dropna(subset=[category_col, OBS_COL, PRED_COL,
-                          LOWER_COL, UPPER_COL]).copy()
-
-    cats = d[category_col].value_counts().head(n_categories).index.tolist()
-    if not cats:
-        print(f"Aucune modalite exploitable dans '{category_col}'.")
-        return
-
-    fig = go.Figure()
-    premier = True
-    xticks, xlabels, annotations = [], [], []
-
-    for i, cat in enumerate(cats):
-        sub_all = d[d[category_col] == cat]
-        couverture = sub_all[INSIDE_COL].mean()          # sur TOUTES les obs
-
-        sub = sub_all.sample(min(n_points, len(sub_all)), random_state=random_state)
-        sub = sub.sort_values(PRED_COL).reset_index(drop=True)
-        if len(sub) < 2:
-            continue
-
-        # Etalement des observations sur la largeur du slot
-        xs = i + np.linspace(-DEMI_LARGEUR, DEMI_LARGEUR, len(sub))
-        lo = sub[LOWER_COL].values.astype(float)
-        hi = sub[UPPER_COL].values.astype(float)
-        pred = sub[PRED_COL].values.astype(float)
-        obs = sub[OBS_COL].values.astype(float)
-        dedans = sub[INSIDE_COL].values.astype(bool)
-
-        hover = [(f"<b>{cat}</b><br>"
-                  f"RBNS observe : {o:,.0f}<br>"
-                  f"Prediction   : {p:,.0f}<br>"
-                  f"Intervalle CP: [{l:,.0f} ; {h:,.0f}]")
-                 for o, p, l, h in zip(obs, pred, lo, hi)]
-
-        # Ruban : vraies bornes individuelles
-        fig.add_trace(go.Scatter(x=xs, y=lo, mode="lines",
-                                 line=dict(color="#355CDE", width=2),
-                                 showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=xs, y=hi, mode="lines",
-                                 line=dict(color="#355CDE", width=2),
-                                 fill="tonexty", fillcolor="rgba(70,110,230,0.20)",
-                                 name=f"Intervalle CP ({100*(1-ALPHA):.0f} %)",
-                                 showlegend=premier, hoverinfo="skip"))
-
-        # Prediction
-        fig.add_trace(go.Scatter(x=xs, y=pred, mode="lines",
-                                 line=dict(color="black", width=2),
-                                 name="Prediction", showlegend=premier,
-                                 hoverinfo="skip"))
-
-        # Observations
-        fig.add_trace(go.Scatter(
-            x=xs[dedans], y=obs[dedans], mode="markers",
-            marker=dict(size=POINT_SIZE, color="#1769E0", opacity=0.85),
-            name="Observation dans le CP", showlegend=premier,
-            text=[h for h, k in zip(hover, dedans) if k],
-            hovertemplate="%{text}<extra></extra>"))
-        fig.add_trace(go.Scatter(
-            x=xs[~dedans], y=obs[~dedans], mode="markers",
-            marker=dict(size=POINT_SIZE + 2, color="#E53935", opacity=0.95),
-            name="Observation hors CP", showlegend=premier,
-            text=[h for h, k in zip(hover, dedans) if not k],
-            hovertemplate="%{text}<extra></extra>"))
-
-        premier = False
-        xticks.append(i)
-        xlabels.append(str(cat))
-        annotations.append(dict(x=i, y=1.0, yref="paper", yanchor="bottom",
-                                text=f"couverture {100*couverture:.1f} %<br>"
-                                     f"<sub>n = {len(sub_all)}</sub>",
-                                showarrow=False, font=dict(size=10)))
-
-    # Separateurs entre categories
-    for i in range(len(xticks) - 1):
-        fig.add_vline(x=xticks[i] + 0.5, line=dict(color="lightgray", width=1))
-
-    obs_all = d[d[category_col].isin(cats)][OBS_COL]
-    log_ok = log_y and (obs_all > 0).all()
-
-    fig.update_layout(
-        title=dict(text=f"Conformal Prediction par {category_col}"
-                        f"<br><sup>Bleu : observation couverte | Rouge : non couverte "
-                        f"| bornes CP individuelles, sans agregation</sup>", x=0.5),
-        xaxis=dict(title=category_col, tickmode="array",
-                   tickvals=xticks, ticktext=xlabels,
-                   range=[-0.6, len(xticks) - 0.4], showgrid=False),
-        yaxis=dict(title=OBS_COL + ("  (log)" if log_ok else ""),
-                   type="log" if log_ok else "linear",
-                   gridcolor="rgba(0,0,0,0.08)"),
-        template="plotly_white", height=680, hovermode="closest",
-        annotations=annotations,
-        legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="center", x=0.5),
-        margin=dict(t=140))
-
-    if out is not None:
-        with out:
-            clear_output(wait=True)
-            fig.show()
-    else:
-        fig.show()
-
-
-# --- Selecteur interactif de la colonne de categorie ---------------------
-cols_dispo = [c for c in ID_COLS if c in results_v2.columns]
-
-out = widgets.Output()
-dd = widgets.Dropdown(options=cols_dispo, value=cols_dispo[0],
-                      description="Categorie :",
-                      layout=widgets.Layout(width="450px"))
-dd.observe(lambda ch: plot_cp_par_categorie(results_v2, ch["new"], out=out)
-           if ch["name"] == "value" else None, names="value")
-display(dd, out)
-plot_cp_par_categorie(results_v2, cols_dispo[0], out=out)
-
-
-
-
-Troisème Chat
-
-
-# ================================================================
-# CONFORMAL PREDICTION — VISUALISATION PAR CATEGORIE
-#
-# X      : LOB / Risk / Partner / autre ID_COL
-# Y      : RBNS_eop observe
-#
-# Bande : vraie borne basse / vraie borne haute CP
-# Ligne : prediction
-#
-# Bleu  : observation DANS l'intervalle CP
-# Rouge : observation HORS de l'intervalle CP
-#
-# Objectif :
-#   - peu de categories (ex. 5)
-#   - bornes larges et lisibles
-#   - prediction au milieu
-#   - observations visibles
-#   - graphique interactif
-# ================================================================
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import ipywidgets as widgets
-from IPython.display import display, clear_output
 
 
 # ================================================================
@@ -309,371 +38,446 @@ from IPython.display import display, clear_output
 # ================================================================
 
 TARGET_COL = "RBNS_eop"
-
+SCORE_COL = "score_priorisation"
 PRED_COL = "y_pred"
-
 LOWER_COL = "borne_basse"
-
 UPPER_COL = "borne_haute"
 
-INSIDE_COL = "dans_intervalle"
+# Nombre d'anomalies affichées
+N_ANOMALIES = 40
 
-# Nombre maximum de catégories affichées
-N_CATEGORIES = 5
-
-# Nombre maximum de points par catégorie
-N_POINTS_PAR_CATEGORIE = 35
-
-# Taille des points
-POINT_SIZE = 5
+# True :
+# score élevé = anomalie plus prioritaire
+SCORE_DESCENDING = True
 
 
 # ================================================================
-# FONCTION PRINCIPALE
+# FONCTION
 # ================================================================
 
-def plot_cp_by_category(
+def plot_cp_priorisation(
     df,
-    category_col,
-    n_categories=5,
-    n_points_per_category=35,
-    random_state=42
+    score_col=SCORE_COL,
+    target_col=TARGET_COL,
+    pred_col=PRED_COL,
+    lower_col=LOWER_COL,
+    upper_col=UPPER_COL,
+    n_anomalies=N_ANOMALIES,
+    descending=SCORE_DESCENDING
 ):
 
-    d = df.copy()
+    data = df.copy()
 
-    # ------------------------------------------------------------
-    # Vérification des colonnes
-    # ------------------------------------------------------------
+    # ============================================================
+    # 1. VERIFICATION DES COLONNES
+    # ============================================================
 
     required = [
-        category_col,
-        TARGET_COL,
-        PRED_COL,
-        LOWER_COL,
-        UPPER_COL,
-        INSIDE_COL
+        score_col,
+        target_col,
+        pred_col,
+        lower_col,
+        upper_col
     ]
 
-    missing = [c for c in required if c not in d.columns]
+    missing = [
+        col for col in required
+        if col not in data.columns
+    ]
 
     if missing:
+
         raise ValueError(
-            f"Colonnes absentes du DataFrame : {missing}"
+            "\nLes colonnes suivantes sont absentes :\n"
+            + "\n".join(f"  • {col}" for col in missing)
+            + "\n\nColonnes disponibles :\n"
+            + "\n".join(f"  • {col}" for col in data.columns)
         )
 
-    # ------------------------------------------------------------
-    # Nettoyage
-    # ------------------------------------------------------------
+    # ============================================================
+    # 2. NETTOYAGE
+    # ============================================================
 
-    d = d.dropna(
-        subset=[
-            category_col,
-            TARGET_COL,
-            PRED_COL,
-            LOWER_COL,
-            UPPER_COL
-        ]
+    data = data.dropna(
+        subset=required
     ).copy()
 
-    # ------------------------------------------------------------
-    # Sélection des catégories les plus représentées
-    # ------------------------------------------------------------
+    # ============================================================
+    # 3. CONVERSION NUMERIQUE
+    # ============================================================
 
-    top_categories = (
-        d[category_col]
-        .value_counts()
-        .head(n_categories)
-        .index
-        .tolist()
-    )
+    for col in required:
 
-    d = d[d[category_col].isin(top_categories)].copy()
-
-    # ------------------------------------------------------------
-    # Ordre des catégories
-    # ------------------------------------------------------------
-
-    category_order = top_categories
-
-    d[category_col] = pd.Categorical(
-        d[category_col],
-        categories=category_order,
-        ordered=True
-    )
-
-    # ------------------------------------------------------------
-    # Sous-échantillonnage pour la lisibilité
-    #
-    # IMPORTANT :
-    # on ne modifie PAS les bornes CP.
-    # On réduit seulement le nombre de points affichés.
-    # ------------------------------------------------------------
-
-    pieces = []
-
-    for cat in category_order:
-
-        tmp = d[d[category_col] == cat].copy()
-
-        if len(tmp) > n_points_per_category:
-            tmp = tmp.sample(
-                n_points_per_category,
-                random_state=random_state
-            )
-
-        pieces.append(tmp)
-
-    d_plot = pd.concat(pieces, ignore_index=True)
-
-    # ------------------------------------------------------------
-    # Calcul des valeurs centrales de chaque catégorie
-    #
-    # Pour la représentation :
-    # prediction = médiane des prédictions
-    # borne basse = médiane des bornes basses
-    # borne haute = médiane des bornes hautes
-    #
-    # ATTENTION :
-    # les couleurs des observations restent basées
-    # sur le vrai statut CP individuel.
-    # ------------------------------------------------------------
-
-    summary = (
-        d.groupby(category_col)
-        .agg(
-            prediction=(PRED_COL, "median"),
-            borne_basse=(LOWER_COL, "median"),
-            borne_haute=(UPPER_COL, "median"),
-            n=(TARGET_COL, "size")
+        data[col] = pd.to_numeric(
+            data[col],
+            errors="coerce"
         )
-        .reindex(category_order)
-        .reset_index()
+
+    data = data.dropna(
+        subset=required
+    ).copy()
+
+    # ============================================================
+    # 4. TRI PAR SCORE DE PRIORISATION
+    # ============================================================
+
+    data = data.sort_values(
+        by=score_col,
+        ascending=not descending
+    ).copy()
+
+    # ============================================================
+    # 5. SELECTION DES ANOMALIES
+    # ============================================================
+
+    if n_anomalies is not None:
+
+        data = data.head(
+            n_anomalies
+        ).copy()
+
+    # ============================================================
+    # 6. NOUVEAU RANG POUR L'AXE X
+    # ============================================================
+
+    data = data.reset_index(drop=False)
+
+    data["rang_priorite"] = np.arange(
+        1,
+        len(data) + 1
     )
 
-    # ------------------------------------------------------------
-    # Position numérique des catégories
-    # ------------------------------------------------------------
+    x = data["rang_priorite"].values
 
-    summary["x"] = np.arange(len(summary))
+    # ============================================================
+    # 7. STATUT DE CHAQUE OBSERVATION
+    # ============================================================
 
-    # Mapping catégorie -> x
-    mapping = {
-        cat: i
-        for i, cat in enumerate(category_order)
-    }
-
-    d_plot["x"] = d_plot[category_col].map(mapping).astype(float)
-
-    # Petit jitter horizontal
-    rng = np.random.default_rng(random_state)
-
-    d_plot["x_jitter"] = (
-        d_plot["x"]
-        + rng.uniform(
-            -0.18,
-            0.18,
-            size=len(d_plot)
-        )
+    data["dans_cp"] = (
+        (data[target_col] >= data[lower_col])
+        &
+        (data[target_col] <= data[upper_col])
     )
 
     # ============================================================
-    # FIGURE
+    # 8. VALEURS CP
+    # ============================================================
+
+    lower = data[lower_col].values
+    upper = data[upper_col].values
+    prediction = data[pred_col].values
+
+    # ============================================================
+    # 9. GRILLE FINE
+    #
+    # On ne crée PAS de nouvelles bornes.
+    #
+    # On interpole seulement entre les observations existantes
+    # afin d'obtenir visuellement une bande continue.
+    # ============================================================
+
+    if len(data) > 1:
+
+        x_fine = np.linspace(
+            x.min(),
+            x.max(),
+            max(500, len(data) * 20)
+        )
+
+        lower_fine = np.interp(
+            x_fine,
+            x,
+            lower
+        )
+
+        upper_fine = np.interp(
+            x_fine,
+            x,
+            upper
+        )
+
+        prediction_fine = np.interp(
+            x_fine,
+            x,
+            prediction
+        )
+
+    else:
+
+        x_fine = x
+        lower_fine = lower
+        upper_fine = upper
+        prediction_fine = prediction
+
+    # ============================================================
+    # 10. FIGURE
     # ============================================================
 
     fig = go.Figure()
 
-    # ------------------------------------------------------------
-    # 1. BANDES CP
-    #
-    # Une bande par catégorie.
-    # ------------------------------------------------------------
-
-    for _, r in summary.iterrows():
-
-        x = r["x"]
-
-        # largeur horizontale de la bande
-        x_left = x - 0.32
-        x_right = x + 0.32
-
-        # borne inférieure
-        fig.add_trace(
-            go.Scatter(
-                x=[x_left, x_right],
-                y=[
-                    r["borne_basse"],
-                    r["borne_basse"]
-                ],
-                mode="lines",
-                line=dict(
-                    color="#355CDE",
-                    width=3
-                ),
-                showlegend=False,
-                hoverinfo="skip"
-            )
-        )
-
-        # borne supérieure
-        fig.add_trace(
-            go.Scatter(
-                x=[x_left, x_right],
-                y=[
-                    r["borne_haute"],
-                    r["borne_haute"]
-                ],
-                mode="lines",
-                line=dict(
-                    color="#355CDE",
-                    width=3
-                ),
-                fill="tonexty",
-                fillcolor="rgba(70,110,230,0.18)",
-                showlegend=False,
-                hoverinfo="skip"
-            )
-        )
-
-    # ------------------------------------------------------------
-    # 2. LIGNE DE PREDICTION
-    # ------------------------------------------------------------
+    # ============================================================
+    # 11. BORNE HAUTE
+    # ============================================================
 
     fig.add_trace(
         go.Scatter(
-            x=summary["x"],
-            y=summary["prediction"],
-            mode="lines+markers",
+            x=x_fine,
+            y=upper_fine,
+            mode="lines",
+            line=dict(
+                color="#4169E1",
+                width=2.5
+            ),
+            name="Borne haute CP",
+            hoverinfo="skip"
+        )
+    )
+
+    # ============================================================
+    # 12. BORNE BASSE + REMPLISSAGE
+    # ============================================================
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_fine,
+            y=lower_fine,
+            mode="lines",
+            line=dict(
+                color="#4169E1",
+                width=2.5
+            ),
+            fill="tonexty",
+            fillcolor="rgba(65,105,225,0.20)",
+            name="Intervalle CP",
+            hoverinfo="skip"
+        )
+    )
+
+    # ============================================================
+    # 13. LIGNE DE PREDICTION
+    # ============================================================
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_fine,
+            y=prediction_fine,
+            mode="lines",
             line=dict(
                 color="black",
                 width=3
             ),
-            marker=dict(
-                size=7,
-                color="black"
-            ),
-            name="Prediction",
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Prediction : %{y:,.0f}<br>"
-                "Borne basse : %{customdata[1]:,.0f}<br>"
-                "Borne haute : %{customdata[2]:,.0f}"
-                "<extra></extra>"
-            ),
-            customdata=np.column_stack([
-                summary[category_col].astype(str),
-                summary["borne_basse"],
-                summary["borne_haute"]
-            ])
+            name="Prédiction",
+            hoverinfo="skip"
         )
     )
 
-    # ------------------------------------------------------------
-    # 3. OBSERVATIONS DANS L'INTERVALLE
-    # ------------------------------------------------------------
+    # ============================================================
+    # 14. OBSERVATIONS DANS LE CP
+    # ============================================================
 
-    inside = d_plot[d_plot[INSIDE_COL] == True]
+    inside = data[
+        data["dans_cp"]
+    ].copy()
 
     fig.add_trace(
         go.Scatter(
-            x=inside["x_jitter"],
-            y=inside[TARGET_COL],
+            x=inside["rang_priorite"],
+            y=inside[target_col],
             mode="markers",
+
             marker=dict(
-                size=POINT_SIZE,
-                color="#1769E0",
-                opacity=0.75
+                size=6,
+                color="#087F23",
+                opacity=0.90,
+                line=dict(
+                    color="white",
+                    width=0.6
+                )
             ),
+
             name="Observation dans le CP",
-            customdata=np.column_stack([
-                inside[category_col].astype(str),
-                inside[PRED_COL],
-                inside[LOWER_COL],
-                inside[UPPER_COL]
-            ]),
+
+            customdata=inside[
+                [
+                    score_col,
+                    pred_col,
+                    lower_col,
+                    upper_col
+                ]
+            ].values,
+
             hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "RBNS_eop observé : %{y:,.0f}<br>"
-                "Prediction : %{customdata[1]:,.0f}<br>"
-                "CP : [%{customdata[2]:,.0f} ; "
-                "%{customdata[3]:,.0f}]"
-                "<extra></extra>"
-            )
-        )
-    )
-
-    # ------------------------------------------------------------
-    # 4. OBSERVATIONS HORS INTERVALLE
-    # ------------------------------------------------------------
-
-    outside = d_plot[d_plot[INSIDE_COL] == False]
-
-    fig.add_trace(
-        go.Scatter(
-            x=outside["x_jitter"],
-            y=outside[TARGET_COL],
-            mode="markers",
-            marker=dict(
-                size=POINT_SIZE + 1,
-                color="#E53935",
-                opacity=0.85
-            ),
-            name="Observation hors CP",
-            customdata=np.column_stack([
-                outside[category_col].astype(str),
-                outside[PRED_COL],
-                outside[LOWER_COL],
-                outside[UPPER_COL]
-            ]),
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "RBNS_eop observé : %{y:,.0f}<br>"
-                "Prediction : %{customdata[1]:,.0f}<br>"
-                "CP : [%{customdata[2]:,.0f} ; "
-                "%{customdata[3]:,.0f}]"
+                "<b>Observation dans le CP</b>"
+                "<br><br>"
+                "<b>Rang :</b> %{x}"
+                "<br>"
+                "<b>Score de priorisation :</b> "
+                "%{customdata[0]:,.3f}"
+                "<br>"
+                "<b>RBNS_eop observé :</b> "
+                "%{y:,.0f}"
+                "<br>"
+                "<b>Prédiction :</b> "
+                "%{customdata[1]:,.0f}"
+                "<br>"
+                "<b>Borne basse :</b> "
+                "%{customdata[2]:,.0f}"
+                "<br>"
+                "<b>Borne haute :</b> "
+                "%{customdata[3]:,.0f}"
                 "<extra></extra>"
             )
         )
     )
 
     # ============================================================
-    # MISE EN FORME
+    # 15. OBSERVATIONS HORS CP
+    # ============================================================
+
+    outside = data[
+        ~data["dans_cp"]
+    ].copy()
+
+    fig.add_trace(
+        go.Scatter(
+            x=outside["rang_priorite"],
+            y=outside[target_col],
+            mode="markers",
+
+            marker=dict(
+                size=7,
+                color="#E31B23",
+                opacity=0.95,
+                line=dict(
+                    color="white",
+                    width=0.7
+                )
+            ),
+
+            name="Observation hors CP",
+
+            customdata=outside[
+                [
+                    score_col,
+                    pred_col,
+                    lower_col,
+                    upper_col
+                ]
+            ].values,
+
+            hovertemplate=(
+                "<b>⚠ Observation hors CP</b>"
+                "<br><br>"
+                "<b>Rang :</b> %{x}"
+                "<br>"
+                "<b>Score de priorisation :</b> "
+                "%{customdata[0]:,.3f}"
+                "<br>"
+                "<b>RBNS_eop observé :</b> "
+                "%{y:,.0f}"
+                "<br>"
+                "<b>Prédiction :</b> "
+                "%{customdata[1]:,.0f}"
+                "<br>"
+                "<b>Borne basse :</b> "
+                "%{customdata[2]:,.0f}"
+                "<br>"
+                "<b>Borne haute :</b> "
+                "%{customdata[3]:,.0f}"
+                "<extra></extra>"
+            )
+        )
+    )
+
+    # ============================================================
+    # 16. AXE X
+    #
+    # On affiche le SCORE et non seulement le rang.
+    # ============================================================
+
+    # Maximum 10 labels pour garder l'axe lisible
+
+    n_ticks = min(
+        10,
+        len(data)
+    )
+
+    if n_ticks > 0:
+
+        tick_indices = np.linspace(
+            0,
+            len(data) - 1,
+            n_ticks,
+            dtype=int
+        )
+
+        tick_indices = np.unique(
+            tick_indices
+        )
+
+        tickvals = (
+            data.iloc[tick_indices]["rang_priorite"]
+            .tolist()
+        )
+
+        ticktext = [
+            f"{score:.2f}"
+            for score in
+            data.iloc[tick_indices][score_col]
+        ]
+
+    else:
+
+        tickvals = []
+        ticktext = []
+
+    # ============================================================
+    # 17. MISE EN FORME
     # ============================================================
 
     fig.update_layout(
 
+        template="plotly_white",
+
         title=dict(
             text=(
-                f"Conformal Prediction — {category_col}<br>"
+                "<b>Conformal Prediction — "
+                "Priorisation des anomalies</b>"
+                "<br>"
                 "<sup>"
-                "Bleu : observations dans l'intervalle | "
-                "Rouge : observations hors intervalle"
+                "Bande bleue : intervalle de prédiction conforme | "
+                "Ligne noire : prédiction"
                 "</sup>"
             ),
-            x=0.5
+            x=0.5,
+            xanchor="center"
         ),
 
         xaxis=dict(
-            title=category_col,
+            title=(
+                "Score de priorisation "
+                "(du plus prioritaire au moins prioritaire)"
+            ),
+
             tickmode="array",
-            tickvals=summary["x"],
-            ticktext=summary[category_col].astype(str),
-            range=[
-                -0.55,
-                len(summary) - 0.45
-            ],
-            showgrid=False
+            tickvals=tickvals,
+            ticktext=ticktext,
+
+            showgrid=False,
+            zeroline=False
         ),
 
         yaxis=dict(
-            title=TARGET_COL,
+            title="RBNS_eop observé",
+
             showgrid=True,
-            gridcolor="rgba(0,0,0,0.08)"
+
+            gridcolor="rgba(0,0,0,0.08)",
+
+            zeroline=False
         ),
 
-        template="plotly_white",
-
-        height=700,
+        height=720,
 
         hovermode="closest",
 
@@ -686,23 +490,27 @@ def plot_cp_by_category(
         ),
 
         margin=dict(
-            l=80,
+            l=90,
             r=40,
-            t=110,
-            b=80
+            t=120,
+            b=100
         )
     )
 
+    # ============================================================
+    # 18. AFFICHAGE
+    # ============================================================
+
     fig.show()
 
-    return d_plot, summary
+    # ============================================================
+    # 19. RETOUR DES DONNEES
+    # ============================================================
 
+    return data, fig
 
-
-
-d_plot, summary = plot_cp_by_category(
-    results_v2,
-    category_col="LOB",
-    n_categories=5,
-    n_points_per_category=35
+data_cp_plot, fig_cp = plot_cp_priorisation(
+    anomalies_prio,
+    n_anomalies=40,
+    descending=True
 )
