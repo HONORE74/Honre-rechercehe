@@ -1,5 +1,5 @@
 # ================================================================
-# BLOC AVANCE — TABLEAU DE BORD LIE (v2)
+# BLOC AVANCE — TABLEAU DE BORD LIE (v3)
 #   Deux menus lies :
 #     1) Dimension  : choisit l'axe d'analyse (Lob, Partner, Risk,
 #        Companies... selon ce qui existe reellement dans vos donnees)
@@ -11,6 +11,9 @@
 #   Cliquer une part met a jour le menu Valeur, qui met a jour les
 #   panneaux du bas. Un seul graphique sous le cercle : la barre des
 #   anomalies les plus critiques (couleur = rang percentile).
+#   Le cercle ET la barre sont des FigureWidget persistantes, mises
+#   a jour en place (pas de fig.show() qui recree un affichage a
+#   chaque fois — c'etait la cause du doublon).
 # ================================================================
 
 import numpy as np
@@ -20,7 +23,10 @@ import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML
 
 
-ECHELLE = "Bluered"
+# Rouge (critique) -> orange -> jaune -> vert (faible) : forte
+# differenciation sur toute la plage, contrairement a "Bluered" qui
+# ecrasait les rangs eleves dans une bande de rouge quasi uniforme.
+ECHELLE = "RdYlGn_r"
 
 # Colonnes candidates pour le menu "Dimension". Seules celles
 # reellement presentes dans anomalies_df seront proposees.
@@ -52,14 +58,12 @@ def _cartes_html(sub, dd_global, titre):
     """Bandeau de statistiques en HTML."""
     part = sub["score_composite"].sum() / max(dd_global["score_composite"].sum(), 1e-12)
     pire = sub.loc[sub["score_composite"].idxmax()] if len(sub) else None
-    gwp = f"{sub[GWP_COL].sum():,.0f}" if GWP_COL in sub.columns else "n/a"
     pire_txt = (f"#{int(pire['rank'])}" if pire is not None
                 and pd.notna(pire.get("rank", np.nan)) else "—")
 
     cartes = [("Anomalies", f"{len(sub):,}", "#37474f"),
               ("Score cumule", f"{sub['score_composite'].sum():,.3g}", "#1565c0"),
               ("Part du score global", f"{100*part:.1f} %", "#c62828"),
-              (f"{GWP_COL} total", gwp, "#2e7d32"),
               ("Pire anomalie", pire_txt, "#6a1b9a")]
 
     blocs = "".join(
@@ -78,43 +82,6 @@ def _cartes_html(sub, dd_global, titre):
         f"<div style='display:flex;gap:10px;flex-wrap:wrap'>{blocs}</div></div>")
 
 
-def _figure_barre(sub, titre, top_n=12):
-    """Un seul panneau : les anomalies les plus critiques, couleur = rang percentile."""
-    if len(sub) == 0:
-        print("Aucune anomalie dans ce segment.")
-        return
-
-    top = sub.nlargest(min(top_n, len(sub)), "score_composite").iloc[::-1]
-    id_cols = [c for c in ID_COLS if c in top.columns]
-    labels = top[id_cols].astype(str).agg(" | ".join, axis=1).str.slice(0, 40)
-
-    rangs_couleur = top["score_composite"].rank(pct=True)
-    fig = go.Figure(go.Bar(
-        x=top["score_composite"], y=labels, orientation="h",
-        marker=dict(color=rangs_couleur, colorscale=ECHELLE, cmin=0, cmax=1,
-                    line=dict(width=0.5, color="white"),
-                    colorbar=dict(title="Rang<br>percentile", thickness=13, len=0.85)),
-        customdata=np.column_stack([
-            top["rank"].fillna(-1), top["y_obs"], top["y_pred"],
-            top["borne_basse"], top["borne_haute"],
-            top[GWP_COL] if GWP_COL in top.columns else np.full(len(top), np.nan)]),
-        hovertemplate="<b>%{y}</b><br>Score : %{x:.4g}<br>"
-                      "Rang global : #%{customdata[0]:.0f}<br>"
-                      "Observe : %{customdata[1]:,.0f}<br>"
-                      "Predit : %{customdata[2]:,.0f}<br>"
-                      "Intervalle : [%{customdata[3]:,.0f} ; %{customdata[4]:,.0f}]<br>"
-                      f"{GWP_COL} : %{{customdata[5]:,.0f}}<extra></extra>",
-        showlegend=False))
-
-    fig.update_layout(
-        title=dict(text=f"Les {len(top)} anomalies les plus critiques — {titre}", font=dict(size=14)),
-        xaxis_title="Score composite",
-        yaxis=dict(tickfont=dict(size=9)),
-        template="plotly_white", height=max(420, 30 * len(top) + 120),
-        margin=dict(l=10, r=90, t=70, b=50))
-    fig.show()
-
-
 def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
     dimensions = dimensions or [c for c in DIMENSIONS_CANDIDATES if c in anomalies_df.columns]
     if not dimensions:
@@ -126,7 +93,6 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
         dd_all[c] = dd_all[c].astype(str)
 
     zone_cartes = widgets.Output()
-    zone_detail = widgets.Output()
 
     selecteur_dim = widgets.Dropdown(
         options=dimensions, value=dimensions[0],
@@ -138,7 +104,13 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
     fw = go.FigureWidget()
     fw.update_layout(template="plotly_white", height=560, margin=dict(t=90, b=20))
 
-    _en_cours = {"flag": False}  # evite les rafraichissements en boucle lors des maj programmatiques
+    fw_barre = go.FigureWidget()
+    fw_barre.update_layout(template="plotly_white", margin=dict(l=10, r=90, t=70, b=50))
+
+    # Verrou unique : empeche toute mise a jour programmatique des
+    # widgets (options/valeur) de redeclencher un rafraichissement
+    # en cascade. C'est la garantie contre les doubles rendus.
+    _verrou = {"actif": False}
 
     def _dessiner_sunburst(colonne):
         niveau = _construire_niveau(dd_all, colonne)
@@ -166,15 +138,45 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
                 hoverinfo="text", insidetextorientation="radial"))
             fw.layout.title = dict(
                 text=f"Repartition par {colonne} — cliquez une part"
-                     "<br><sup>Taille = score cumule | Couleur = gravite (bleu faible, rouge critique)</sup>",
+                     "<br><sup>Taille = score cumule | Couleur = gravite (rouge critique, vert faible)</sup>",
                 font=dict(size=15))
-
-        try:
-            fw.data[0].on_click(_au_clic)
-        except Exception:
-            pass
-
+        fw.data[0].on_click(_au_clic)
         return niveau
+
+    def _maj_figure_barre(sub, titre):
+        with fw_barre.batch_update():
+            fw_barre.data = []
+            if len(sub) == 0:
+                fw_barre.layout.title = dict(text=f"Aucune anomalie — {titre}", font=dict(size=14))
+                fw_barre.layout.height = 200
+                return
+
+            top = sub.nlargest(min(top_n, len(sub)), "score_composite").iloc[::-1]
+            id_cols = [c for c in ID_COLS if c in top.columns]
+            labels = top[id_cols].astype(str).agg(" | ".join, axis=1).str.slice(0, 40)
+            rangs_couleur = top["score_composite"].rank(pct=True)
+
+            fw_barre.add_trace(go.Bar(
+                x=top["score_composite"], y=labels, orientation="h",
+                marker=dict(color=rangs_couleur, colorscale=ECHELLE, cmin=0, cmax=1,
+                            line=dict(width=0.5, color="white"),
+                            colorbar=dict(title="Rang<br>percentile", thickness=13, len=0.85)),
+                customdata=np.column_stack([
+                    top["rank"].fillna(-1), top["y_obs"], top["y_pred"],
+                    top["borne_basse"], top["borne_haute"],
+                    top[GWP_COL] if GWP_COL in top.columns else np.full(len(top), np.nan)]),
+                hovertemplate="<b>%{y}</b><br>Score : %{x:.4g}<br>"
+                              "Rang global : #%{customdata[0]:.0f}<br>"
+                              "Observe : %{customdata[1]:,.0f}<br>"
+                              "Predit : %{customdata[2]:,.0f}<br>"
+                              "Intervalle : [%{customdata[3]:,.0f} ; %{customdata[4]:,.0f}]<br>"
+                              f"{GWP_COL} : %{{customdata[5]:,.0f}}<extra></extra>",
+                showlegend=False))
+            fw_barre.layout.title = dict(
+                text=f"Les {len(top)} anomalies les plus critiques — {titre}", font=dict(size=14))
+            fw_barre.layout.xaxis.title = "Score composite"
+            fw_barre.layout.yaxis.tickfont = dict(size=9)
+            fw_barre.layout.height = max(420, 30 * len(top) + 120)
 
     def _rafraichir_panneaux():
         colonne = selecteur_dim.value
@@ -183,22 +185,24 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
         with zone_cartes:
             clear_output(wait=True)
             display(_cartes_html(sub, dd_all, titre))
-        with zone_detail:
-            clear_output(wait=True)
-            _figure_barre(sub, titre, top_n=top_n)
+        _maj_figure_barre(sub, titre)
 
     def _changer_dimension(change=None):
-        colonne = selecteur_dim.value
-        niveau = _dessiner_sunburst(colonne)
-        _en_cours["flag"] = True
-        selecteur_val.options = [("— Vue generale —", "")] + [
-            (f"{r['label']}  ({r['n']})", r["label"]) for _, r in niveau.iterrows()]
-        selecteur_val.value = ""
-        _en_cours["flag"] = False
+        if _verrou["actif"]:
+            return
+        _verrou["actif"] = True
+        try:
+            colonne = selecteur_dim.value
+            niveau = _dessiner_sunburst(colonne)
+            selecteur_val.options = [("— Vue generale —", "")] + [
+                (f"{r['label']}  ({r['n']})", r["label"]) for _, r in niveau.iterrows()]
+            selecteur_val.value = ""
+        finally:
+            _verrou["actif"] = False
         _rafraichir_panneaux()
 
     def _changer_valeur(change=None):
-        if _en_cours["flag"]:
+        if _verrou["actif"]:
             return
         _rafraichir_panneaux()
 
@@ -207,8 +211,8 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
             return
         selecteur_val.value = trace.labels[points.point_inds[0]]  # declenche _changer_valeur
 
-    selecteur_dim.observe(lambda c: _changer_dimension() if c["name"] == "value" else None, names="value")
-    selecteur_val.observe(lambda c: _changer_valeur() if c["name"] == "value" else None, names="value")
+    selecteur_dim.observe(lambda c: _changer_dimension(), names="value")
+    selecteur_val.observe(lambda c: _changer_valeur(), names="value")
 
     display(HTML(
         "<div style='font-family:system-ui,sans-serif;font-size:12px;color:#546e7a;"
@@ -217,16 +221,9 @@ def dashboard_critique(anomalies_df, dimensions=None, top_n=12):
         "Cliquer une part du cercle fait aussi avancer le menu Valeur."
         "</div>"))
     display(widgets.HBox([selecteur_dim, selecteur_val]))
-    display(fw, zone_cartes, zone_detail)
+    display(fw, zone_cartes, fw_barre)
 
     _changer_dimension()
 
 
 dashboard_critique(anomalies_prio, dimensions=["Lob", "Partner", "Risk"])
-
-
-
-
-
-
-ECHELLE = "RdYlGn_r"
