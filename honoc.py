@@ -1,3 +1,454 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================================================================
+# TABLEAU DE BORD — version revisee
+#   ① Cercle a couches empilables — couleur = GRAVITE MOYENNE
+#   ② Maille (ligne 1) puis valeur (ligne 2), independantes du cercle
+#   ③ Panneaux : cartes -> bar plot des scores -> FOREST PLOT
+#   (heatmap "rang percentile" supprimee, panneau CQR remplace)
+# ================================================================
+# ┌─────────────────── PARAMETRES A MODIFIER ───────────────────┐
+TOP_N_PANNEAUX = 12       # Nombre d'anomalies dans le bar plot ET le forest plot
+                          # (meme granularite volontairement)
+ECHELLE        = "Bluered"   # Bleu = peu grave, rouge = grave
+LOG_FOREST     = True     # Echelle log sur l'axe des montants du forest plot
+COL_BARPLOT    = "score_composite"   # Grandeur des barres.
+                          # Alternative : "abs_z" pour la gravite pure sans GWP
+# └──────────────────────────────────────────────────────────────┘
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+
+VUE_GENERALE = ""
+
+
+# ------------------------------------------------------------- helpers
+
+def _labels(d, maxlen=34):
+    id_cols = [c for c in ID_COLS if c in d.columns]
+    return d[id_cols].astype(str).agg(" | ".join, axis=1).str.slice(0, maxlen)
+
+
+def _hover(r, id_cols):
+    t = (f"<b>{' | '.join(str(r[c]) for c in id_cols)}</b><br>"
+         f"Observe    : {r['y_obs']:,.0f}<br>"
+         f"Predit     : {r['y_pred']:,.0f}<br>"
+         f"Intervalle : [{r['borne_basse']:,.0f} ; {r['borne_haute']:,.0f}]")
+    if "rank" in r.index and pd.notna(r["rank"]):
+        t += f"<br>Rang priorite : #{int(r['rank'])}"
+    if "score_composite" in r.index:
+        t += f"<br>Score : {r['score_composite']:.4g}"
+    if GWP_COL in r.index:
+        t += f"<br>{GWP_COL} : {r[GWP_COL]:,.0f}"
+    return t
+
+
+def _hierarchie(dd, chemin):
+    lignes = []
+    for prof in range(1, len(chemin) + 1):
+        cols = chemin[:prof]
+        agg = {"score_total": ("score_composite", "sum"),
+               "score_moyen": ("score_composite", "mean"),
+               "score_max":   ("score_composite", "max"),
+               "n":           ("score_composite", "size")}
+        if GWP_COL in dd.columns:
+            agg["gwp"] = (GWP_COL, "sum")
+        g = dd.groupby(cols, observed=True).agg(**agg).reset_index()
+        for _, r in g.iterrows():
+            vals = [str(r[c]) for c in cols]
+            lignes.append({"id": "/".join(vals), "label": vals[-1],
+                           "parent": "/".join(vals[:-1]) if prof > 1 else "",
+                           "profondeur": prof, "score_total": r["score_total"],
+                           "score_moyen": r["score_moyen"], "score_max": r["score_max"],
+                           "n": int(r["n"]), "gwp": r.get("gwp", np.nan)})
+    return pd.DataFrame(lignes)
+
+
+def _filtrer_maille(df, colonne, valeur):
+    if not valeur:
+        return df, f"{colonne} — vue generale"
+    return df[df[colonne].astype(str) == str(valeur)], f"{colonne} = {valeur}"
+
+
+def _cartes(sub, dd_global, titre, sub_expl=None):
+    part = sub["score_composite"].sum() / max(dd_global["score_composite"].sum(), 1e-12)
+    gwp = (f"{sub[GWP_COL].sum():,.0f}"
+           if GWP_COL in sub.columns and sub[GWP_COL].notna().any() else "n/a")
+    grav = (f"{sub['score_composite'].mean():,.4g}" if len(sub) else "—")
+    pire = "—"
+    if len(sub) and "rank" in sub.columns:
+        rk = sub.loc[sub["score_composite"].idxmax(), "rank"]
+        if pd.notna(rk):
+            pire = f"#{int(rk)}"
+    couv = (f"{100*sub_expl['dans_intervalle'].mean():.1f} %"
+            if sub_expl is not None and len(sub_expl) else "n/a")
+
+    cartes = [("Anomalies", f"{len(sub):,}", "#37474f"),
+              ("Gravite moyenne", grav, "#c62828"),
+              ("Score cumule", f"{sub['score_composite'].sum():,.3g}", "#1565c0"),
+              ("Part du score global", f"{100*part:.1f} %", "#ad1457"),
+              (f"{GWP_COL} total", gwp, "#2e7d32"),
+              ("Couverture CQR", couv, "#00838f"),
+              ("Pire anomalie", pire, "#6a1b9a")]
+    blocs = "".join(
+        f"<div style='flex:1;min-width:130px;background:#fff;border:1px solid #e0e0e0;"
+        f"border-left:5px solid {c};border-radius:7px;padding:11px 13px;"
+        f"box-shadow:0 1px 3px rgba(0,0,0,.07)'>"
+        f"<div style='font-size:10.5px;color:#78909c;text-transform:uppercase;"
+        f"letter-spacing:.6px'>{t}</div>"
+        f"<div style='font-size:19px;font-weight:600;color:{c};margin-top:4px'>{v}</div>"
+        f"</div>" for t, v, c in cartes)
+    return HTML(f"<div style='font-family:system-ui,sans-serif;margin:6px 0 14px 0'>"
+                f"<div style='font-size:15px;font-weight:600;color:#263238;"
+                f"margin-bottom:10px'>📍 {titre}</div>"
+                f"<div style='display:flex;gap:9px;flex-wrap:wrap'>{blocs}</div></div>")
+
+
+# ------------------- panneau 1 : bar plot seul (heatmap supprimee)
+
+def _creer_fw_bar():
+    fig = go.Figure(go.Bar(x=[], y=[], orientation="h", showlegend=False,
+                           marker=dict(colorscale=ECHELLE, cmin=0, cmax=1,
+                                       line=dict(width=0.5, color="white"))))
+    fig.update_layout(template="plotly_white", height=520,
+                      xaxis_title="Score composite",
+                      yaxis=dict(tickfont=dict(size=9)),
+                      margin=dict(l=10, r=40, t=90, b=45))
+    return go.FigureWidget(fig)
+
+
+def _maj_fw_bar(fw, sub, titre, top_n=TOP_N_PANNEAUX, col=COL_BARPLOT):
+    if len(sub) == 0:
+        with fw.batch_update():
+            fw.data[0].x, fw.data[0].y = [], []
+            fw.layout.title = dict(text=f"{titre}<br><sup>Aucune anomalie</sup>",
+                                   font=dict(size=14))
+            fw.layout.height = 260
+        return
+    cle = col if col in sub.columns else "score_composite"
+    top = sub.nlargest(min(top_n, len(sub)), cle).iloc[::-1]
+    labels = _labels(top).tolist()
+    id_cols = [c for c in ID_COLS if c in top.columns]
+    with fw.batch_update():
+        fw.data[0].x = top[cle].tolist()
+        fw.data[0].y = labels
+        fw.data[0].marker.color = top[cle].rank(pct=True).tolist()
+        fw.data[0].text = [_hover(r, id_cols) for _, r in top.iterrows()]
+        fw.data[0].hovertemplate = "%{text}<extra></extra>"
+        fw.layout.xaxis.title.text = ("Score composite" if cle == "score_composite"
+                                      else cle)
+        fw.layout.title = dict(
+            text=f"Les {len(top)} anomalies les plus critiques — {titre}",
+            font=dict(size=14))
+        fw.layout.height = max(360, 34 * len(top) + 150)
+
+
+# ------------------- panneau 2 : FOREST PLOT (remplace le panneau CQR)
+
+def _creer_fw_forest():
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+                             line=dict(color="#3a6bbf", width=10), opacity=0.3,
+                             name=f"Intervalle conforme ({100*(1-ALPHA):.0f} %)",
+                             hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+                             line=dict(color="#c0392b", width=2, dash="dot"),
+                             showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[], y=[], mode="markers", name="Prediction",
+                             marker=dict(symbol="diamond", size=10, color="white",
+                                         line=dict(color="black", width=1.5))))
+    fig.add_trace(go.Scatter(x=[], y=[], mode="markers", name="Valeur comptabilisee",
+                             marker=dict(size=13, color="#c0392b",
+                                         line=dict(color="#7b241c", width=1.3))))
+    fig.update_layout(template="plotly_white", height=520,
+                      xaxis=dict(title=TARGET),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.03,
+                                  xanchor="center", x=0.5),
+                      margin=dict(l=10, r=40, t=110, b=50))
+    return go.FigureWidget(fig)
+
+
+def _maj_fw_forest(fw, sub, titre, top_n=TOP_N_PANNEAUX, log_x=LOG_FOREST):
+    if len(sub) == 0:
+        with fw.batch_update():
+            for t in fw.data:
+                t.x, t.y = [], []
+            fw.layout.title = dict(text=f"{titre}<br><sup>Aucune anomalie</sup>",
+                                   font=dict(size=14))
+            fw.layout.height = 260
+        return
+
+    d = sub.nlargest(min(top_n, len(sub)), "score_composite").iloc[::-1].reset_index(drop=True)
+    y = list(range(len(d)))
+    id_cols = [c for c in ID_COLS if c in d.columns]
+    lo = d["borne_basse"].values.astype(float)
+    hi = d["borne_haute"].values.astype(float)
+    obs = d["y_obs"].values.astype(float)
+    pred = d["y_pred"].values.astype(float)
+    log_ok = bool(log_x and (obs > 0).all() and (pred > 0).all() and (lo > 0).all())
+
+    xs_band, ys_band = [], []
+    for yi, l, h in zip(y, lo, hi):
+        xs_band += [l, h, None]
+        ys_band += [yi, yi, None]
+
+    xs_over, ys_over = [], []
+    for yi, o, l, h in zip(y, obs, lo, hi):
+        cible = h if o > h else l
+        xs_over += [cible, o, None]
+        ys_over += [yi, yi, None]
+
+    textes = [_hover(r, id_cols) for _, r in d.iterrows()]
+    ticks = [f"#{int(r)}  {l}" if pd.notna(r) else l
+             for r, l in zip(d.get("rank", pd.Series([np.nan] * len(d))),
+                             _labels(d))]
+
+    with fw.batch_update():
+        fw.data[0].x, fw.data[0].y = xs_band, ys_band
+        fw.data[1].x, fw.data[1].y = xs_over, ys_over
+        fw.data[2].x, fw.data[2].y = pred, y
+        fw.data[2].text = textes
+        fw.data[2].hovertemplate = "%{text}<extra></extra>"
+        fw.data[3].x, fw.data[3].y = obs, y
+        fw.data[3].text = textes
+        fw.data[3].hovertemplate = "%{text}<extra></extra>"
+        fw.layout.xaxis.type = "log" if log_ok else "linear"
+        fw.layout.xaxis.title.text = TARGET + ("  (log)" if log_ok else "")
+        fw.layout.yaxis = dict(tickmode="array", tickvals=y, ticktext=ticks,
+                               tickfont=dict(size=9))
+        fw.layout.title = dict(
+            text=f"Intervalle conforme, prediction et valeur observee — {titre}"
+                 "<br><sup>Une unite statistique par ligne, meme granularite que "
+                 "le graphique ci-dessus</sup>", font=dict(size=14))
+        fw.layout.height = max(400, 40 * len(d) + 170)
+
+
+# ------------------------------------------------------------- dashboard
+
+def dashboard_complet(anomalies_prio, expl, top_n=TOP_N_PANNEAUX):
+    cols = [c for c in ID_COLS if c in anomalies_prio.columns and c in expl.columns]
+    if not cols:
+        print("Aucune colonne d'identification commune.")
+        return
+
+    dd = anomalies_prio.dropna(subset=["score_composite"]).copy()
+    ex = expl.copy()
+    for c in cols:
+        dd[c] = dd[c].astype(str)
+        ex[c] = ex[c].astype(str)
+    score_global = dd["score_composite"].sum()
+    verrou = {"actif": False}
+
+    # ---- ① Couches du cercle ------------------------------------------
+    prefs = [c for c in ["Lob", "Partner", "Companies", "Risk"] if c in cols]
+    defauts = [prefs[0] if prefs else cols[0], None, None, None]
+    niveaux = [widgets.Dropdown(
+        options=[("— aucun —", None)] + [(c, c) for c in cols],
+        value=defauts[i], description=f"Couche {i+1} :",
+        layout=widgets.Layout(width="255px"),
+        style={"description_width": "72px"}) for i in range(4)]
+
+    fw_cercle = go.FigureWidget(data=[go.Sunburst(ids=[], labels=[], parents=[],
+                                                  values=[], branchvalues="total")])
+    fw_cercle.update_layout(template="plotly_white", height=620, margin=dict(t=110, b=20))
+
+    # ---- ② Maille puis valeur -----------------------------------------
+    maille_defaut = prefs[0] if prefs else cols[0]
+    sel_maille = widgets.Dropdown(
+        options=[(c, c) for c in cols], value=maille_defaut,
+        description="1 · Maille :", layout=widgets.Layout(width="330px"),
+        style={"description_width": "90px"})
+    sel_valeur = widgets.Dropdown(
+        options=[("— vue generale —", VUE_GENERALE)], value=VUE_GENERALE,
+        description="2 · Valeur :", layout=widgets.Layout(width="480px"),
+        style={"description_width": "90px"})
+
+    z_cartes = widgets.Output()
+    fw_bar = _creer_fw_bar()
+    fw_forest = _creer_fw_forest()
+
+    def _chemin():
+        vus, out = set(), []
+        for w in niveaux:
+            if w.value and w.value not in vus:
+                out.append(w.value)
+                vus.add(w.value)
+        return out
+
+    def _maj_cercle(*_):
+        chemin = _chemin()
+        if not chemin:
+            with fw_cercle.batch_update():
+                t = fw_cercle.data[0]
+                t.ids, t.labels, t.parents, t.values = [], [], [], []
+                fw_cercle.layout.title = dict(text="Activez au moins une couche.",
+                                              font=dict(size=15))
+            return
+        h = _hierarchie(dd, chemin)
+        # CONDITION : la couleur est la GRAVITE MOYENNE en valeur reelle,
+        # bornee au P95 pour que la queue lourde n'ecrase pas l'echelle
+        cmax = float(np.nanpercentile(h["score_moyen"], 95)) or float(h["score_moyen"].max())
+        survol = [f"<b>{r['label']}</b><br>"
+                  f"Gravite moyenne : {r['score_moyen']:.4g}<br>"
+                  f"─────────────<br>Anomalies : {r['n']}<br>"
+                  f"Score cumule : {r['score_total']:.4g} "
+                  f"({100*r['score_total']/score_global:.1f} % du total)<br>"
+                  f"Pire anomalie : {r['score_max']:.4g}"
+                  + (f"<br>{GWP_COL} : {r['gwp']:,.0f}" if pd.notna(r["gwp"]) else "")
+                  for _, r in h.iterrows()]
+        with fw_cercle.batch_update():
+            t = fw_cercle.data[0]
+            t.ids, t.labels = h["id"].tolist(), h["label"].tolist()
+            t.parents, t.values = h["parent"].tolist(), h["score_total"].tolist()
+            t.text = [f"{100*v/score_global:.0f} %" for v in h["score_total"]]
+            t.texttemplate = "%{label}<br>%{text}"
+            t.hovertext, t.hoverinfo = survol, "text"
+            t.insidetextorientation = "radial"
+            t.maxdepth = len(chemin)
+            t.marker = dict(colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
+                            cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
+                            colorbar=dict(title="Gravite<br>moyenne", thickness=16,
+                                          len=0.7, tickformat=".2g"))
+            fw_cercle.layout.title = dict(
+                text=f"Repartition des {len(dd)} anomalies — {len(chemin)} couche(s) : "
+                     f"{' › '.join(chemin)}"
+                     "<br><sup>Taille = score cumule | Couleur = gravite moyenne "
+                     "(bleu faible, rouge elevee)</sup>", font=dict(size=15))
+
+    def _maj_panneaux(*_):
+        colonne, valeur = sel_maille.value, sel_valeur.value
+        sub, titre = _filtrer_maille(dd, colonne, valeur)
+        sub_ex, _ = _filtrer_maille(ex, colonne, valeur)
+        with z_cartes:
+            clear_output(wait=True)
+            display(_cartes(sub, dd, titre, sub_ex))
+        _maj_fw_bar(fw_bar, sub, titre, top_n=top_n)
+        _maj_fw_forest(fw_forest, sub, titre, top_n=top_n)
+
+    def _options_valeurs(colonne):
+        g = (dd.groupby(colonne, observed=True)["score_composite"]
+               .agg(["size", "sum"]).reset_index().sort_values("sum", ascending=False))
+        return [("— vue generale —", VUE_GENERALE)] + [
+            (f"{r[colonne]}  ({int(r['size'])} anomalies)", str(r[colonne]))
+            for _, r in g.iterrows()]
+
+    def _maj_valeurs(*_):
+        if verrou["actif"]:
+            return
+        verrou["actif"] = True
+        try:
+            sel_valeur.options = _options_valeurs(sel_maille.value)
+            sel_valeur.value = VUE_GENERALE
+        finally:
+            verrou["actif"] = False
+        _maj_panneaux()
+
+    def _au_clic(trace, points, state):
+        if not points.point_inds:
+            return
+        parts = trace.ids[points.point_inds[0]].split("/")
+        chemin = _chemin()
+        if not parts or len(parts) > len(chemin):
+            return
+        colonne, valeur = chemin[len(parts) - 1], parts[-1]
+        verrou["actif"] = True
+        try:
+            sel_maille.value = colonne
+            sel_valeur.options = _options_valeurs(colonne)
+            dispo = [v for _, v in sel_valeur.options]
+            sel_valeur.value = valeur if valeur in dispo else VUE_GENERALE
+        finally:
+            verrou["actif"] = False
+        _maj_panneaux()
+
+    try:
+        fw_cercle.data[0].on_click(_au_clic)
+        clic = True
+    except Exception:
+        clic = False
+
+    for w in niveaux:
+        w.observe(lambda c: _maj_cercle() if c["name"] == "value" else None, names="value")
+    sel_maille.observe(lambda c: _maj_valeurs() if c["name"] == "value" else None,
+                       names="value")
+    sel_valeur.observe(lambda c: (_maj_panneaux() if not verrou["actif"] else None)
+                       if c["name"] == "value" else None, names="value")
+
+    def _bandeau(txt, fond="#eceff1", coul="#37474f"):
+        return HTML(f"<div style='font-family:system-ui,sans-serif;font-size:12.5px;"
+                    f"color:{coul};background:{fond};padding:9px 13px;border-radius:6px;"
+                    f"margin:14px 0 8px 0'>{txt}</div>")
+
+    display(_bandeau(
+        "<b>① COUCHES DU CERCLE</b> — chaque couche activee ajoute un anneau. "
+        "Couleur = gravite moyenne des anomalies du segment."))
+    display(widgets.HBox(niveaux[:2]), widgets.HBox(niveaux[2:]))
+    display(fw_cercle)
+
+    display(_bandeau(
+        "<b>② PANNEAUX DE DETAIL</b> — commandes independantes du cercle. "
+        "Maille (ligne 1) puis valeur (ligne 2). "
+        f"Maille active par defaut : <b>{maille_defaut}</b>."
+        + ("<br>Le clic sur un segment du cercle synchronise ces deux commandes."
+           if clic else ""),
+        fond="#e3f2fd", coul="#0d47a1"))
+    display(sel_maille)
+    display(sel_valeur)
+    display(z_cartes, fw_bar, fw_forest)
+
+    _maj_cercle()
+    _maj_valeurs()
+    return {"cercle": fw_cercle, "bar": fw_bar, "forest": fw_forest,
+            "maille": sel_maille, "valeur": sel_valeur}
+
+
+controles = dashboard_complet(anomalies_prio, expl)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ================================================================
 # TABLEAU DE BORD — cercle a couches empilables + panneaux a maille propre
 #
