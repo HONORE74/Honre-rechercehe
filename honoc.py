@@ -2109,6 +2109,233 @@ def dashboard_evolution(anomalies_prio, expl_df, n_unites=N_UNITES_LISTE,
         "croix rouge = hors intervalle.</div>"))
     display(selecteur, zone)
     _maj()
+
+
+
+
+
+
+
+
+
+
+dernier
+
+
+
+
+# ================================================================
+# DIAGNOSTIC DES ANOMALIES — anomalie reelle ou defaillance du modele ?
+#
+#   Principe : la couverture LOCALE du segment separe les deux cas.
+#     - segment bien couvert + point isole hors intervalle -> anomalie
+#     - segment mal couvert -> le modele echoue ici (epistemique)
+# ================================================================
+# ┌─────────────────── PARAMETRES A MODIFIER ───────────────────┐
+MAILLE_DIAG   = "Lob"     # Maille de calcul de la couverture locale.
+                          # Plus fine (Partner) = plus precis mais effectifs faibles.
+N_MIN_DIAG    = 20        # Effectif minimum pour juger la couverture d'un segment.
+                          # En dessous, verdict "indeterminable".
+SEUIL_Z_FORT  = 2.0       # |z| au-dela duquel l'ecart est juge severe
+MARGE_COUV    = 0.05      # Tolerance sur la couverture : un segment est declare
+                          # defaillant si sa couverture est significativement
+                          # inferieure a (1 - ALPHA - MARGE_COUV)
+# └──────────────────────────────────────────────────────────────┘
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy.stats import norm
+
+
+def _wilson_bas(k, n, conf=0.95):
+    """Borne INFERIEURE de Wilson : couverture minimale plausible du segment."""
+    z = norm.ppf(1 - (1 - conf) / 2)
+    k, n = np.asarray(k, float), np.asarray(n, float)
+    p = np.divide(k, n, out=np.zeros_like(k), where=n > 0)
+    den = 1 + z**2 / n
+    centre = (p + z**2 / (2 * n)) / den
+    marge = (z / den) * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
+    return np.clip(centre - marge, 0, 1)
+
+
+def diagnostiquer_anomalies(expl, anomalies_prio, maille=MAILLE_DIAG,
+                            n_min=N_MIN_DIAG, seuil_z=SEUIL_Z_FORT,
+                            marge=MARGE_COUV):
+    ex = expl.dropna(subset=["y_obs", "y_pred", "borne_basse", "borne_haute"]).copy()
+    ex[maille] = ex[maille].astype(str)
+
+    # --- 1. Couverture locale de chaque segment ---
+    seg = (ex.groupby(maille, observed=True)
+             .agg(n_seg=("dans_intervalle", "size"),
+                  n_couv=("dans_intervalle", "sum"))
+             .reset_index())
+    seg["couverture"] = seg["n_couv"] / seg["n_seg"]
+    seg["couv_ic_bas"] = _wilson_bas(seg["n_couv"], seg["n_seg"])
+    # CONDITION : segment declare defaillant si sa couverture PLAUSIBLE MAXIMALE
+    # reste sous la cible -> ce n'est pas du hasard, le modele echoue ici
+    seg["modele_defaillant"] = (seg["couv_ic_bas"] < (1 - ALPHA - marge)) & \
+                               (seg["n_seg"] >= n_min)
+    seg["effectif_suffisant"] = seg["n_seg"] >= n_min
+
+    # --- 2. Largeur relative mediane du segment (proxy d'incertitude du modele) ---
+    ex["largeur_rel"] = ((ex["borne_haute"] - ex["borne_basse"])
+                         / np.maximum(ex["y_pred"].abs(), 1e-9))
+    med_larg = (ex.groupby(maille, observed=True)["largeur_rel"]
+                  .median().rename("largeur_rel_med").reset_index())
+    seg = seg.merge(med_larg, on=maille, how="left")
+
+    # --- 3. Jointure sur les anomalies ---
+    d = anomalies_prio.copy()
+    d[maille] = d[maille].astype(str)
+    centre = (d["borne_haute"] + d["borne_basse"]) / 2
+    demi = np.maximum((d["borne_haute"] - d["borne_basse"]) / 2, 1e-9)
+    d["z"] = (d["y_obs"] - centre) / demi
+    d["abs_z"] = d["z"].abs()
+    d["largeur_rel"] = ((d["borne_haute"] - d["borne_basse"])
+                        / np.maximum(d["y_pred"].abs(), 1e-9))
+    d = d.merge(seg, on=maille, how="left")
+
+    # --- 4. Verdict ---
+    # CONDITION 1 : effectif insuffisant -> on ne peut rien conclure
+    # CONDITION 2 : segment defaillant -> l'ecart traduit l'echec du modele
+    # CONDITION 3 : segment sain + ecart severe -> anomalie probable
+    # CONDITION 4 : segment sain + ecart modere -> a surveiller
+    d["verdict"] = np.select(
+        [~d["effectif_suffisant"].fillna(False),
+         d["modele_defaillant"].fillna(False),
+         d["abs_z"] >= seuil_z,
+         d["abs_z"] < seuil_z],
+        ["Indeterminable (effectif insuffisant)",
+         "Defaillance du modele (segment mal couvert)",
+         "ANOMALIE PROBABLE (segment sain, ecart severe)",
+         "Ecart limite (segment sain, ecart modere)"],
+        default="Non classe")
+
+    # --- 5. Signal complementaire : intervalle anormalement etroit ---
+    # Un ecart severe alors que le modele se disait TRES sur de lui est le
+    # signal le plus fort : il ne peut pas s'expliquer par l'incertitude.
+    d["modele_confiant"] = d["largeur_rel"] < d["largeur_rel_med"]
+    d["signal_fort"] = (d["verdict"].str.startswith("ANOMALIE")) & d["modele_confiant"]
+
+    # --- 6. Synthese ---
+    print("=" * 84)
+    print(f"DIAGNOSTIC DES {len(d)} ANOMALIES — maille : {maille}")
+    print("=" * 84)
+    for v, n in d["verdict"].value_counts().items():
+        print(f"  {v:<52} {n:>5}  ({100*n/len(d):>5.1f} %)")
+    print("-" * 84)
+    print(f"  dont SIGNAL FORT (modele confiant + ecart severe) : "
+          f"{int(d['signal_fort'].sum())}")
+    print("=" * 84)
+
+    nb_def = int(seg["modele_defaillant"].sum())
+    if nb_def:
+        print(f"\n/!\\ {nb_def} segment(s) ou le modele est structurellement defaillant :")
+        print(seg[seg["modele_defaillant"]]
+              .sort_values("couverture")[[maille, "n_seg", "couverture", "couv_ic_bas"]]
+              .head(10).to_string(index=False))
+        print("    -> Dans ces segments, les ecarts traduisent un probleme de MODELE,")
+        print("       pas de donnee. Ne les presentez pas comme des anomalies metier.")
+
+    return d, seg
+
+
+diag, segments = diagnostiquer_anomalies(expl, anomalies_prio)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================================================================
+# CARTE DE DIAGNOSTIC — visualiser la separation
+#   X : couverture du segment (le modele fonctionne-t-il ici ?)
+#   Y : |z| de l'anomalie (a quel point l'ecart est severe)
+#   Le quadrant en haut a droite = anomalies defendables
+# ================================================================
+
+def carte_diagnostic(diag, seuil_z=SEUIL_Z_FORT, marge=MARGE_COUV):
+    couleurs = {
+        "ANOMALIE PROBABLE (segment sain, ecart severe)": "#c62828",
+        "Ecart limite (segment sain, ecart modere)":       "#ef6c00",
+        "Defaillance du modele (segment mal couvert)":     "#1565c0",
+        "Indeterminable (effectif insuffisant)":           "#9e9e9e"}
+
+    fig = go.Figure()
+    fig.add_vrect(x0=0, x1=1 - ALPHA - marge, fillcolor="rgba(21,101,192,0.10)",
+                  line_width=0, annotation_text="zone de defaillance du modele",
+                  annotation_position="top left")
+    fig.add_vline(x=1 - ALPHA, line=dict(color="black", width=2, dash="dash"),
+                  annotation_text=f"couverture cible {100*(1-ALPHA):.0f} %")
+    fig.add_hline(y=seuil_z, line=dict(color="#c62828", width=1.6, dash="dot"),
+                  annotation_text=f"|z| = {seuil_z}")
+
+    for v, c in couleurs.items():
+        sub = diag[diag["verdict"] == v]
+        if sub.empty:
+            continue
+        taille = (8 + 16 * sub["score_composite"].rank(pct=True)
+                  if "score_composite" in sub.columns else 9)
+        id_cols = [x for x in ID_COLS if x in sub.columns]
+        fig.add_trace(go.Scatter(
+            x=sub["couverture"], y=sub["abs_z"], mode="markers",
+            marker=dict(size=taille, color=c, opacity=0.75,
+                        line=dict(width=0.5, color="white"),
+                        symbol=np.where(sub["signal_fort"], "star", "circle")),
+            name=f"{v.split('(')[0].strip()} ({len(sub)})",
+            customdata=np.column_stack([
+                sub[id_cols].astype(str).agg(" | ".join, axis=1),
+                sub["n_seg"], sub["largeur_rel"], sub["y_obs"], sub["y_pred"]]),
+            hovertemplate="<b>%{customdata[0]}</b><br>"
+                          "Couverture du segment : %{x:.1%} (n=%{customdata[1]:.0f})<br>"
+                          "|z| : %{y:.2f}<br>"
+                          "Largeur relative : %{customdata[2]:.1%}<br>"
+                          "Observe : %{customdata[3]:,.0f} | "
+                          "Predit : %{customdata[4]:,.0f}<extra></extra>"))
+
+    fig.update_layout(
+        title="Carte de diagnostic — anomalie reelle ou defaillance du modele ?"
+              "<br><sup>A droite de la ligne noire : le modele est fiable dans ce segment, "
+              "l'ecart est imputable a la donnee. Etoile = signal fort "
+              "(modele confiant ET ecart severe)</sup>",
+        xaxis=dict(title="Couverture du segment", tickformat=".0%", range=[0, 1.02]),
+        yaxis=dict(title="Severite de l'ecart  |z|"),
+        template="plotly_white", height=660, hovermode="closest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5))
+    fig.show()
+
+
+carte_diagnostic(diag)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     return selecteur
 
 
