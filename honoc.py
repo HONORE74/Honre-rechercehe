@@ -1,3 +1,60 @@
+
+EXCLURE = [TARGET, TIME_COL, "year", "quarter", "annee", "pays"] + ID_COLS
+FEATURES = [c for c in df.columns if c not in EXCLURE]
+
+for sd in (df_train, df_valid, df_test):
+    for c in FEATURES:
+        if sd[c].dtype == object:
+            sd[c] = sd[c].astype("category")
+
+masque = lambda d: d[TARGET].notna() & (d[TARGET] >= 0)
+
+X_tr, y_tr = df_train.loc[masque(df_train), FEATURES], df_train.loc[masque(df_train), TARGET]
+X_va, y_va = df_valid.loc[masque(df_valid), FEATURES], df_valid.loc[masque(df_valid), TARGET]
+X_te, y_te = df_test.loc[masque(df_test),  FEATURES], df_test.loc[masque(df_test),  TARGET]
+
+params = dict(
+    objective="tweedie",
+    tweedie_variance_power=float(p_optimal),
+    metric="tweedie",
+    n_estimators=3000,
+    learning_rate=0.03,
+    num_leaves=64,
+    max_depth=-1,
+    min_child_samples=30,
+    subsample=0.8, subsample_freq=1,
+    colsample_bytree=0.8,
+    reg_alpha=0.1, reg_lambda=1.0,
+    random_state=42, n_jobs=-1, verbose=-1
+)
+
+modele = lgb.LGBMRegressor(**params)
+suivi = {}
+
+modele.fit(
+    X_tr, y_tr,
+    eval_set=[(X_tr, y_tr), (X_va, y_va)],
+    eval_names=["Entraînement", "Validation"],
+    callbacks=[
+        lgb.early_stopping(200, verbose=False),
+        lgb.log_evaluation(0),
+        lgb.record_evaluation(suivi)
+    ]
+)
+print(f"Meilleure itération : {modele.best_iteration_}")
+
+
+
+
+
+
+
+
+
+
+
+
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
