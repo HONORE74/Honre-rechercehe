@@ -1,49 +1,45 @@
-import joblib, json, lightgbm as lgb, sklearn
-from pathlib import Path
-from datetime import datetime
+# ┌─── PARAMETRES ───┐
+COLS_TABLEAU = ["Partner", "Companies", "Lob", "Activity", "Risk"]  # variables à afficher
+TRIER_PAR    = "ecart_abs"   # "ecart_abs" | "y_obs" | "y_pred"
+N_AFFICHE    = 30
+# └──────────────────┘
 
-CHEMIN_FINAL = Path(DOSSIER_ARTEFACTS) / "modele_final.joblib"
+modele_final = modele_apres          # le modèle retenu après tuning
 
-# Catégories exactes vues à l'entraînement — indispensable, sinon LightGBM
-# réencode différemment au rechargement et les prédictions sont fausses.
-categories = {c: list(X_tr[c].cat.categories)
-              for c in X_tr.columns if str(X_tr[c].dtype) == "category"}
+# --- Prédiction sur le TEST uniquement ---
+pred_test = predire(modele_final, X_te)
 
-modele_final_paquet = {
-    "modele":        modele_final,
-    "features":      list(X_tr.columns),
-    "categorielles": list(categories.keys()),
-    "categories":    categories,
-    "params":        params_finaux,
-    "metriques_test": metriques("Test", y_te, pred_test),
-    "target":        TARGET,
-    "date":          datetime.now().isoformat(timespec="seconds"),
-    "versions":      {"lightgbm": lgb.__version__,
-                      "sklearn":  sklearn.__version__,
-                      "joblib":   joblib.__version__},
-}
+# --- Tableau observé / prédit enrichi des variables métier ---
+cols_dispo = [c for c in COLS_TABLEAU if c in df.columns]
+resultats_test = df.loc[X_te.index, cols_dispo + ["year", "quarter"]].copy()
+resultats_test["y_obs"]  = np.asarray(y_te, float)
+resultats_test["y_pred"] = pred_test
+resultats_test["ecart"]        = resultats_test.y_pred - resultats_test.y_obs
+resultats_test["ecart_abs"]    = resultats_test.ecart.abs()
+resultats_test["ecart_rel_%"]  = 100 * resultats_test.ecart / resultats_test.y_obs.replace(0, np.nan)
+resultats_test["ratio"]        = resultats_test.y_pred / resultats_test.y_obs.replace(0, np.nan)
 
-joblib.dump(modele_final_paquet, CHEMIN_FINAL)
-print(f"Sauvegardé : {CHEMIN_FINAL.resolve()}")
-print(f"Taille     : {CHEMIN_FINAL.stat().st_size/1e6:.2f} Mo")
-print(f"Variables  : {len(modele_final_paquet['features'])}")
-print(f"MAE test   : {modele_final_paquet['metriques_test']['MAE']:,.0f}")
-print(f"LightGBM   : {lgb.__version__}")
+resultats_test = resultats_test.sort_values(TRIER_PAR, ascending=False).reset_index(drop=True)
 
-# --- Vérification immédiate : rechargement et comparaison ---
-p = joblib.load(CHEMIN_FINAL)
-Xv = X_te[p["features"]].copy()
-for c in p["categorielles"]:
-    Xv[c] = pd.Categorical(Xv[c].astype(str), categories=p["categories"][c])
-ecart = np.abs(np.clip(p["modele"].predict(Xv), 0, None) - pred_test).max()
-print(f"\nÉcart après rechargement : {ecart:.10f}  {'OK' if ecart < 1e-6 else '/!\\ ANOMALIE'}")
+print(f"Prédictions sur le test : {len(resultats_test):,} lignes")
+print(f"Somme observée : {resultats_test.y_obs.sum():,.0f}")
+print(f"Somme prédite  : {resultats_test.y_pred.sum():,.0f}"
+      f"   (ratio {resultats_test.y_pred.sum()/resultats_test.y_obs.sum():.4f})")
+print(f"MAE : {resultats_test.ecart_abs.mean():,.0f}\n")
 
+fmt = {c: "{:,.0f}" for c in ["y_obs","y_pred","ecart","ecart_abs"]}
+fmt.update({"ecart_rel_%": "{:,.1f}", "ratio": "{:,.3f}"})
+try:
+    display(resultats_test.head(N_AFFICHE).style
+            .background_gradient(subset=["ecart_abs"], cmap="Reds")
+            .format(fmt)
+            .set_caption(f"Test — {N_AFFICHE} plus grands écarts"))
+except Exception:
+    print(resultats_test.head(N_AFFICHE).to_string(index=False,
+          float_format=lambda v: f"{v:,.2f}"))
 
-
-
-
-
-
+resultats_test.to_csv("predictions_test.csv", index=False)
+print("\nExporté : predictions_test.csv")
 
 
 
@@ -104,6 +100,13 @@ print(f"Test       : {len(X_te):,} lignes | MAE {paquet['mae_test']:,.0f}")
 
 
 
+
+
+
+
+
+
+
 import joblib, numpy as np, pandas as pd
 
 paquet = joblib.load("artefacts_modele/modele_final.joblib")   # a adapter
@@ -134,6 +137,28 @@ print(f"Somme predite  : {res.y_pred.sum():,.0f}  (ratio {res.y_pred.sum()/res.y
 print(res.head(20).to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
 res.to_csv("predictions_test.csv", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
