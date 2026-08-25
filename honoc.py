@@ -1,3 +1,234 @@
+
+
+
+
+
+
+
+
+# ================================================================
+# FIGURES CQR — definitions completes dans le bon ordre
+#   Prerequis : results_v2, anomalies_prio, ID_COLS, ALPHA, TARGET
+# ================================================================
+# ┌─── PARAMETRES ───┐
+N_AFFICHE = 350      # observations tracees sur la figure canonique
+N_NORM    = 600      # observations tracees sur la vue normalisee
+LOG_AXES  = True
+# └──────────────────┘
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+COUL_OK, COUL_ANO = "#1769E0", "#E53935"
+
+
+# ---------------------------------------------------------------- 1. HELPER
+
+def _injecter_score(results_v2, anomalies_prio):
+    """Rapatrie score_composite et rank dans results_v2 (NaN pour les non-anomalies).
+    Protege contre l'explosion combinatoire de la fusion."""
+    cles = [c for c in ID_COLS if c in results_v2.columns and c in anomalies_prio.columns]
+    for c in ["year", "quarter"]:
+        if c in results_v2.columns and c in anomalies_prio.columns:
+            cles.append(c)
+
+    if "score_composite" not in anomalies_prio.columns or not cles:
+        return results_v2.assign(score_composite=np.nan, rank=np.nan)
+
+    # CONDITION : un seul enregistrement par cle, le plus grave
+    ap = (anomalies_prio.sort_values("score_composite", ascending=False)
+                        .drop_duplicates(subset=cles, keep="first"))
+    if len(ap) < len(anomalies_prio):
+        print(f"/!\\ {len(anomalies_prio)-len(ap)} doublons sur {cles} -> retires")
+
+    out = results_v2.merge(ap[cles + ["score_composite", "rank"]],
+                           on=cles, how="left", validate="one_to_one")
+    assert len(out) == len(results_v2), "La fusion a duplique des lignes."
+    return out
+
+
+# ---------------------------------------------------------------- 2. FIGURE CANONIQUE
+
+def figure_cqr_canonique(results_v2, anomalies_prio,
+                         n_affiche=N_AFFICHE, log_axes=LOG_AXES, seed=42):
+    """X = valeur observee | Y = prediction avec barre d'erreur = intervalle CQR.
+    Une barre qui touche la diagonale = observation couverte."""
+    d = _injecter_score(results_v2, anomalies_prio)
+    d = d.dropna(subset=["y_obs", "y_pred", "borne_basse", "borne_haute"])
+
+    couverture  = d["dans_intervalle"].mean()
+    largeur_moy = (d["borne_haute"] - d["borne_basse"]).mean()
+    n_total     = len(d)
+    if len(d) > n_affiche:
+        d = d.sample(n_affiche, random_state=seed)
+    d = d.reset_index(drop=True)
+
+    obs  = d["y_obs"].values.astype(float)
+    pred = d["y_pred"].values.astype(float)
+    lo   = d["borne_basse"].values.astype(float)
+    hi   = d["borne_haute"].values.astype(float)
+    dedans = d["dans_intervalle"].values.astype(bool)
+
+    sc = d["score_composite"].values.astype(float)
+    sc_out = sc[~dedans]
+    taille_out = (7 + 13 * pd.Series(sc_out).rank(pct=True).fillna(.5).values
+                  if np.isfinite(sc_out).any() else np.full(int((~dedans).sum()), 9.))
+
+    id_cols = [c for c in ID_COLS if c in d.columns]
+
+    def _hov(i):
+        r = d.iloc[i]
+        t = (f"<b>{' | '.join(str(r[c]) for c in id_cols)}</b><br>"
+             f"Observe    : {r['y_obs']:,.0f}<br>"
+             f"Predit     : {r['y_pred']:,.0f}<br>"
+             f"Intervalle : [{r['borne_basse']:,.0f} ; {r['borne_haute']:,.0f}]<br>"
+             f"Largeur    : {r['borne_haute']-r['borne_basse']:,.0f}")
+        if pd.notna(r.get("rank", np.nan)):
+            t += f"<br>Rang priorite : #{int(r['rank'])}  (score {r['score_composite']:.4g})"
+        return t
+
+    log_ok = bool(log_axes and (obs > 0).all() and (pred > 0).all() and (lo > 0).all())
+
+    fig = go.Figure()
+    lim = [min(obs.min(), lo.min()), max(obs.max(), hi.max())]
+    fig.add_scatter(x=lim, y=lim, mode="lines", name="y = x (prediction parfaite)",
+                    line=dict(color="black", width=1.6, dash="dash"), hoverinfo="skip")
+
+    fig.add_scatter(
+        x=obs[dedans], y=pred[dedans], mode="markers",
+        error_y=dict(type="data", symmetric=False,
+                     array=hi[dedans] - pred[dedans],
+                     arrayminus=pred[dedans] - lo[dedans],
+                     color="rgba(23,105,224,0.45)", thickness=1.1, width=0),
+        marker=dict(size=6, color=COUL_OK),
+        name=f"Observation couverte ({int(dedans.sum())})",
+        text=[_hov(i) for i in np.where(dedans)[0]],
+        hovertemplate="%{text}<extra></extra>")
+
+    fig.add_scatter(
+        x=obs[~dedans], y=pred[~dedans], mode="markers",
+        error_y=dict(type="data", symmetric=False,
+                     array=hi[~dedans] - pred[~dedans],
+                     arrayminus=pred[~dedans] - lo[~dedans],
+                     color="rgba(229,57,53,0.6)", thickness=1.4, width=0),
+        marker=dict(size=taille_out, color=COUL_ANO,
+                    line=dict(width=0.6, color="#8e0000")),
+        name=f"Observation NON couverte ({int((~dedans).sum())})",
+        text=[_hov(i) for i in np.where(~dedans)[0]],
+        hovertemplate="%{text}<extra></extra>")
+
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.02, y=0.98, xanchor="left", yanchor="top",
+        text=(f"<b>Couverture : {100*couverture:.1f} %</b>  (cible {100*(1-ALPHA):.0f} %)<br>"
+              f"Largeur moyenne : {largeur_moy:,.0f}<br>"
+              f"<sub>calcule sur {n_total:,} obs. — {len(d)} affichees</sub>"),
+        showarrow=False, align="left", bgcolor="rgba(255,255,255,0.9)",
+        bordercolor="black", borderwidth=1, borderpad=6, font=dict(size=11))
+
+    fig.update_layout(
+        title="Conformalized Quantile Regression — intervalles individuels"
+              "<br><sup>Une barre qui touche la diagonale = observation couverte. "
+              "Taille des points rouges = priorite d'investigation</sup>",
+        xaxis=dict(title="Valeur observee" + ("  (log)" if log_ok else ""),
+                   type="log" if log_ok else "linear"),
+        yaxis=dict(title="Prediction et intervalle CQR" + ("  (log)" if log_ok else ""),
+                   type="log" if log_ok else "linear"),
+        template="plotly_white", height=720, hovermode="closest",
+        legend=dict(x=0.98, y=0.02, xanchor="right", yanchor="bottom",
+                    bgcolor="rgba(255,255,255,0.9)", bordercolor="black", borderwidth=1))
+    fig.show()
+
+
+# ---------------------------------------------------------------- 3. VUE NORMALISEE
+
+def figure_normalisee_cqr(results_v2, anomalies_prio, n_affiche=N_NORM, seed=42):
+    """z = (observe - centre) / demi-largeur : tous les intervalles ramenes a [-1 ; +1]."""
+    d = _injecter_score(results_v2, anomalies_prio)
+    d = d.dropna(subset=["y_obs", "y_pred", "borne_basse", "borne_haute"])
+    if len(d) > n_affiche:
+        d = d.sample(n_affiche, random_state=seed)
+    d = d.sort_values("y_pred").reset_index(drop=True)
+
+    centre = (d["borne_haute"].values + d["borne_basse"].values) / 2
+    demi   = np.maximum((d["borne_haute"].values - d["borne_basse"].values) / 2, 1e-9)
+    z  = (d["y_obs"].values - centre) / demi
+    xs = d["y_pred"].values.astype(float)
+    dedans = d["dans_intervalle"].values.astype(bool)
+    log_ok = bool((xs > 0).all())
+    id_cols = [c for c in ID_COLS if c in d.columns]
+
+    def _hov(i):
+        r = d.iloc[i]
+        t = (f"<b>{' | '.join(str(r[c]) for c in id_cols)}</b><br>z = {z[i]:.2f}<br>"
+             f"Observe : {r['y_obs']:,.0f}<br>Predit : {r['y_pred']:,.0f}<br>"
+             f"Intervalle : [{r['borne_basse']:,.0f} ; {r['borne_haute']:,.0f}]")
+        if pd.notna(r.get("rank", np.nan)):
+            t += f"<br>Rang priorite : #{int(r['rank'])}"
+        return t
+
+    fig = go.Figure()
+    fig.add_hrect(y0=-1, y1=1, fillcolor="rgba(70,110,230,0.18)", line_width=0,
+                  annotation_text=f"Zone conforme ({100*(1-ALPHA):.0f} %)",
+                  annotation_position="top left")
+    for yv in (1, -1):
+        fig.add_hline(y=yv, line=dict(color="#355CDE", width=2))
+    fig.add_hline(y=0, line=dict(color="black", width=1.4))
+
+    fig.add_scatter(x=xs[dedans], y=z[dedans], mode="markers",
+                    marker=dict(size=5, color=COUL_OK, opacity=.7),
+                    name=f"Couverte ({int(dedans.sum())})",
+                    text=[_hov(i) for i in np.where(dedans)[0]],
+                    hovertemplate="%{text}<extra></extra>")
+    fig.add_scatter(x=xs[~dedans], y=z[~dedans], mode="markers",
+                    marker=dict(size=8, color=COUL_ANO,
+                                line=dict(width=0.6, color="#8e0000")),
+                    name=f"Hors intervalle ({int((~dedans).sum())})",
+                    text=[_hov(i) for i in np.where(~dedans)[0]],
+                    hovertemplate="%{text}<extra></extra>")
+
+    fig.update_layout(
+        title="Vue normalisee — tous les intervalles ramenes a [-1 ; +1]"
+              "<br><sup>Changement de repere : aucune borne modifiee. "
+              "|z| se lit comme la severite</sup>",
+        xaxis=dict(title="Prediction" + ("  (log)" if log_ok else ""),
+                   type="log" if log_ok else "linear"),
+        yaxis=dict(title="Position normalisee  z"),
+        template="plotly_white", height=620, hovermode="closest")
+    fig.show()
+
+
+# ---------------------------------------------------------------- 4. APPELS
+
+print("Definies :", [n for n in ["_injecter_score", "figure_cqr_canonique",
+                                 "figure_normalisee_cqr"] if n in globals()])
+
+figure_cqr_canonique(results_v2, anomalies_prio)
+figure_normalisee_cqr(results_v2, anomalies_prio)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ================================================================
 # BLOC F1 — TIME EVOLUTION : preparation
 # ================================================================
