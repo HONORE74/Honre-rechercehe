@@ -606,3 +606,141 @@ RANG_UNITE, N_PER, N_VAR = 1, 12, 6
 UNITE = unite_par_rang(RANG_UNITE)
 print(f"Rang #{RANG_UNITE} — {' · '.join(UNITE)}")
 evolution_unite(UNITE, expl, style="sparkline", n_periodes=N_PER, n_vars=N_VAR);
+
+
+
+
+
+
+
+
+
+
+def _sparkline(h, per, ctx, variables, nom, methode):
+    """STYLE 2 — panneau RBNS avec axes lisibles + reticule,
+    sparklines compactes pour les variables secondaires."""
+    series = [(v, PAL["doux"][i % len(PAL["doux"])]) for i, v in enumerate(variables)]
+    n_rows = 1 + len(series)
+    hauteurs = [.52] + [.48/len(series)]*len(series) if series else [1.0]
+    fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
+                        vertical_spacing=.045, row_heights=hauteurs)
+
+    vals = h[TARGET].values.astype(float)
+
+    # ---------- Bande verticale sur la periode validee ----------
+    if ctx and ctx["periode"] in per:
+        k = per.index(ctx["periode"])
+        for r in range(1, n_rows + 1):
+            fig.add_vrect(x0=k-.5, x1=k+.5, fillcolor="rgba(99,110,250,0.055)",
+                          line_width=0, layer="below", row=r, col=1)
+
+    # ---------- Panneau 1 : RBNS avec axes complets ----------
+    fig.add_scatter(x=per, y=vals, mode="lines", line=dict(width=0), fill="tozeroy",
+                    fillcolor="rgba(99,110,250,0.12)", showlegend=False,
+                    hoverinfo="skip", row=1, col=1)
+
+    if ctx and ctx["periode"] in per:
+        fig.add_scatter(x=[ctx["periode"], ctx["periode"]], y=[ctx["lo"], ctx["hi"]],
+                        mode="lines", line=dict(color=PAL["bordure"], width=15),
+                        opacity=.26, name=f"Intervalle CP {100*(1-ALPHA):.0f} %",
+                        hovertemplate=f"Intervalle<br>[{ctx['lo']:,.0f} ; "
+                                      f"{ctx['hi']:,.0f}]<extra></extra>", row=1, col=1)
+        fig.add_scatter(x=[ctx["periode"]], y=[ctx["pred"]], mode="markers",
+                        marker=dict(size=10, symbol="diamond", color="white",
+                                    line=dict(color=PAL["encre"], width=1.8)),
+                        name="Prediction",
+                        hovertemplate=f"Prediction : {ctx['pred']:,.0f}<extra></extra>",
+                        row=1, col=1)
+
+    fig.add_scatter(x=per, y=vals, mode="lines+markers",
+                    line=dict(color=PAL["encre"], width=2.8, shape="spline", smoothing=.55),
+                    marker=dict(size=9, color="white",
+                                line=dict(color=PAL["encre"], width=2.2)),
+                    name=TARGET,
+                    hovertemplate="<b>%{x}</b><br>" + TARGET +
+                                  " : <b>%{y:,.0f}</b><extra></extra>", row=1, col=1)
+
+    if ctx and ctx["periode"] in per:
+        c = PAL["ano"] if not ctx["couvert"] else PAL["ok"]
+        halo = PAL["halo"] if not ctx["couvert"] else "rgba(61,90,158,0.18)"
+        for taille in (36, 24):
+            fig.add_scatter(x=[ctx["periode"]], y=[ctx["obs"]], mode="markers",
+                            marker=dict(size=taille, color=halo), showlegend=False,
+                            hoverinfo="skip", row=1, col=1)
+        fig.add_scatter(x=[ctx["periode"]], y=[ctx["obs"]], mode="markers",
+                        marker=dict(size=13, color=c, line=dict(color="white", width=2.4)),
+                        name="Hors intervalle" if not ctx["couvert"] else "Couvert",
+                        hovertemplate=f"Observe : {ctx['obs']:,.0f}<extra></extra>",
+                        row=1, col=1)
+
+    # ---------- Panneaux suivants : sparklines compactes ----------
+    for i, (v, c) in enumerate(series, start=2):
+        vv = h[v].values.astype(float)
+        fig.add_scatter(x=per, y=vv, mode="lines",
+                        line=dict(color=c, width=2.3, shape="spline", smoothing=.65),
+                        fill="tozeroy", fillcolor=PAL["aire"], showlegend=False,
+                        row=i, col=1,
+                        hovertemplate=f"<b>%{{x}}</b><br>{v} : <b>%{{y:,.4g}}</b>"
+                                      "<extra></extra>")
+        fig.add_scatter(x=[per[-1]], y=[vv[-1]], mode="markers",
+                        marker=dict(size=8, color=c), showlegend=False,
+                        hoverinfo="skip", row=i, col=1)
+        fig.add_annotation(xref="paper", x=1.012, y=vv[-1], xanchor="left",
+                           text=f"<b>{vv[-1]:,.4g}</b>"
+                                f"<br><span style='font-size:9px'>{v}</span>",
+                           showarrow=False, align="left",
+                           font=dict(size=12.5, color=c), row=i, col=1)
+
+    # ---------- Axes ----------
+    # Panneau 1 : valeurs lisibles + reticule
+    fig.update_yaxes(title_text=f"<b>{TARGET}</b>", title_font=dict(size=12),
+                     showticklabels=True, tickformat=",.0f", tickfont=dict(size=11),
+                     gridcolor=PAL["grille"], zeroline=False,
+                     showspikes=True, spikemode="across", spikethickness=1.2,
+                     spikedash="dot", spikecolor=PAL["texte"], row=1, col=1)
+    # Panneaux secondaires : epures
+    for i in range(2, n_rows + 1):
+        fig.update_yaxes(showgrid=False, showticklabels=False, zeroline=False,
+                         row=i, col=1)
+
+    fig.update_xaxes(showgrid=False, showticklabels=False, linecolor=PAL["grille"],
+                     showspikes=True, spikemode="across", spikethickness=1.2,
+                     spikedash="dot", spikecolor=PAL["texte"])
+    fig.update_xaxes(title_text="<b>Trimestre</b>", title_font=dict(size=12),
+                     showticklabels=True, tickfont=dict(size=11), tickangle=0,
+                     row=n_rows, col=1)
+
+    delta = 100*(vals[-1] - vals[0])/abs(vals[0]) if vals[0] else np.nan
+    fleche = "▲" if delta >= 0 else "▼"
+
+    fig.update_layout(
+        title=dict(text=f"<b style='font-size:18px;color:{PAL['encre']}'>{nom}</b>"
+                        f"<br><span style='font-size:11.5px'>{TARGET} · {len(h)} trimestres · "
+                        f"{per[0]} → {per[-1]} · "
+                        f"<span style='color:{PAL['ano'] if delta<0 else PAL['ok']}'>"
+                        f"{fleche} {abs(delta):.1f} %</span> sur la periode · "
+                        f"variables via {methode}</span>", x=.015, xanchor="left"),
+        height=330 + 95*len(series), hovermode="x unified",
+        hoverlabel=dict(bgcolor="white", bordercolor=PAL["grille"], align="left",
+                        font=dict(size=12.5, family="Inter, system-ui, sans-serif",
+                                  color=PAL["encre"])),
+        legend=dict(orientation="h", y=1.03, x=1, xanchor="right",
+                    bgcolor="rgba(255,255,255,0)", font=dict(size=11)),
+        **MISE_EN_FORME)
+    return fig
+
+
+
+
+
+
+
+
+
+
+# ┌─── PARAMETRES ───┐
+RANG_UNITE, N_PER, N_VAR = 1, 12, 6
+# └──────────────────┘
+UNITE = unite_par_rang(RANG_UNITE)
+print(f"Rang #{RANG_UNITE} — {' · '.join(UNITE)}")
+evolution_unite(UNITE, expl, style="sparkline", n_periodes=N_PER, n_vars=N_VAR);
