@@ -1,936 +1,640 @@
+# -*- coding: utf-8 -*-
 # =============================================================================
-#  PIPELINE FINAL - COMPARAISON DE MODELES + SPLIT CONFORMAL PREDICTION
-#  Validation des indicateurs IFRS 17 / Solvabilite II
+#  CQR (Conformalized Quantile Regression) - NOTEBOOK ORDONNE DE BOUT EN BOUT
+#  Memoire : detection et priorisation d'observations atypiques (IFRS 17 / S2)
 #
-#  DECOUPAGE TEMPOREL FIXE (pas de rolling) :
-#      TRAIN        2020Q1 -> 2024Q2   (apprentissage des 3 modeles)
-#      CALIBRATION  2024Q3             (scores de non-conformite)
-#      TEST         2024Q4             (evaluation finale, jamais vu)
+#  Chaque bloc "# %%" est une cellule Jupyter. A executer DANS L'ORDRE.
+#  Pre-requis : la variable df_model doit exister dans la session.
 #
-#  ---------------------------------------------------------------------------
-#  POURQUOI PAS DE ROLLING FORECAST ? (justification a reprendre au memoire)
-#  ---------------------------------------------------------------------------
-#  Le rolling forecast multiplie les points d'evaluation et teste la robustesse
-#  temporelle, mais il presente trois inconvenients pour ce travail :
-#
-#   1. GARANTIE CONFORME DIFFICILE A ENONCER. La prediction conforme garantit
-#      P(Y in C(X)) >= 1-alpha pour UN jeu de calibration donne. En rolling, le
-#      jeu de calibration change a chaque pas : la couverture observee agrege
-#      des garanties distinctes, ce qui rend l'enonce theorique flou.
-#      Avec un decoupage fixe, la garantie s'enonce une fois, proprement.
-#
-#   2. ECART AVEC LA REALITE OPERATIONNELLE. En validation de cloture, on ne
-#      reestime pas un modele a chaque trimestre passe : on dispose d'un
-#      historique et l'on controle la cloture courante. Le decoupage fixe
-#      reproduit exactement cette situation.
-#
-#   3. COUT ET LISIBILITE. Le rolling reentraine n fois trois modeles, sans
-#      apporter de reponse supplementaire a la question de recherche, qui
-#      porte sur la capacite a signaler les atypismes d'une cloture donnee.
-#
-#  LIMITE ASSUMEE : une seule periode de test signifie que les resultats
-#  dependent des specificites de 2024Q4. Ce point doit figurer dans les
-#  limites de l'etude.
-#  ---------------------------------------------------------------------------
-#
-#  PLAN :
-#    BLOC 0   Configuration (A RENSEIGNER)
-#    BLOC 1   Chargement et preparation temporelle
-#    BLOC 2   Decoupage train / calibration / test
-#    BLOC 3   Preprocessing partage (identique pour les 3 modeles)
-#    BLOC 4   Entrainement LightGBM / XGBoost / GLM
-#    BLOC 5   Evaluation comparative
-#    BLOC 6   Visualisations comparatives
-#    BLOC 7   Split Conformal Prediction (3 variantes)
-#    BLOC 8   Validite, efficacite et couverture conditionnelle
-#    BLOC 9   Priorisation des sous-portefeuilles atypiques
-#    BLOC 10  Visualisations conformes
-#    BLOC 11  Sauvegarde
+#  Contrainte projet respectee : AUCUN logarithme, nulle part (ni donnees,
+#  ni axes). Toute mise a l'echelle passe par des divisions ou des rangs.
 # =============================================================================
 
+
+# %% ==========================================================================
+#  CELLULE 0 - IMPORTS ET CONFIGURATION
 # =============================================================================
-# BLOC 0 - CONFIGURATION  (les seules lignes a adapter)
-# =============================================================================
-import warnings, joblib
+import re
+import warnings
+
+import joblib
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import lightgbm as lgb
-import xgboost as xgb
-import statsmodels.api as sm
 
-from sklearn.metrics import mean_absolute_error
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-pd.set_option("display.width", 220)
-pd.set_option("display.max_columns", 80)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 60)
 
-# --- Source des donnees ------------------------------------------------------
-#  Le script utilise `df_model` s'il existe deja en memoire (cas normal).
-#  CHEMIN_DONNEES ne sert que de repli si `df_model` n'est pas defini.
-CHEMIN_DONNEES = "base_indicateurs.csv"   # <-- repli uniquement
-TARGET         = "montant"                 # <-- nom de la colonne cible
-
-# --- Colonnes de structure ---------------------------------------------------
-COL_ANNEE   = "annee"       # colonne annee (entier ou texte)
-COL_TIME    = "Time"        # colonne trimestre au format "Q1".."Q4"
-ID_COLS     = ["Partner", "Companies", "Lob", "Activity", "Periodicity", "Risk"]
-
-# --- Decoupage temporel ------------------------------------------------------
-TRAIN_DEBUT = (2020, 1)     # (annee, trimestre)
-TRAIN_FIN   = (2024, 2)
-CALIBRATION = (2024, 3)
-TEST        = (2024, 4)
-
-# --- Colonnes a exclure (fuite averee) ---------------------------------------
-LEAK_COLS = []              # <-- a completer apres audit de fuite
-
-# --- Parametres de modelisation ---------------------------------------------
-RANDOM_STATE     = 42
-TWEEDIE_POWER    = 1.7      # identique pour les 3 modeles : comparaison equitable
-MIN_MODALITE     = 50       # modalite vue < 50 fois -> regroupee dans "AUTRE"
-GLM_MAX_FEATURES = 60       # garde-fou : un GLM sur 300 colonnes ne converge pas
+# --- Cible et fuites ---------------------------------------------------------
+TARGET = "RBNS_eop"
+LEAKS  = ["Conso", "Currencies", "period", "Reinsurance"]
 
 # --- Parametres conformes ----------------------------------------------------
-ALPHA           = 0.10                              # couverture visee 90 %
-ALPHAS_BALAYAGE = [0.20, 0.15, 0.10, 0.05, 0.01]
+ALPHA   = 0.10   # couverture visee = 1 - ALPHA = 90 %
+N_CALIB = 2      # trimestres reserves a la calibration (1 est trop peu, cf. §)
+N_TEST  = 1      # trimestres reserves au test
 
-QUARTER_MAP = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+# --- Periodes a ecarter (trimestres non clotures ou corrompus) ---------------
+# Present dans pipeline_conformal_complet.py:88 et absent du notebook : c'est
+# une source de NaN independante du filtre sur la cible.
+EXCLURE_PERIODES = [(2024, 3)]
+
+# --- Encodage des categorielles ----------------------------------------------
+#   "natif"    -> LightGBM gere les categorielles directement (RECOMMANDE)
+#   "pipeline" -> ColumnTransformer scikit-learn (impute + standardise + one-hot)
+MODE_ENCODAGE = "natif"
+
+MIN_FREQ_MODALITE = 20   # utilise seulement en mode "pipeline"
+
+# --- Artefact du modele LightGBM entraine dans l'autre notebook --------------
+CHEMIN_ARTEFACT = "artefacts_modele/modele_final.joblib"
+
+QUARTER_MAP  = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+RANDOM_STATE = 42
+
+ID_COLS_BRUTS = ["Partner", "Companies", "Lob", "Activity", "Periodicity", "Risk"]
+
+print(f"Configuration : ALPHA={ALPHA} | N_CALIB={N_CALIB} | N_TEST={N_TEST} "
+      f"| encodage={MODE_ENCODAGE}")
 
 
+# %% ==========================================================================
+#  CELLULE 1 - PREPARATION TEMPORELLE
+#
+#  L'index temporel est construit AVANT toute autre chose. Dans la version
+#  precedente il etait cree apres la cellule qui fait df = df_model.copy(),
+#  donc re-executer cette cellule effacait time_idx et cassait le decoupage.
 # =============================================================================
-# BLOC 1 - CHARGEMENT ET PREPARATION TEMPORELLE
-# =============================================================================
-print("=" * 78)
-print("PIPELINE FINAL - 3 MODELES + SPLIT CONFORMAL PREDICTION")
-print("=" * 78)
+def construire_time_idx(frame: pd.DataFrame, annee_ref=None) -> pd.DataFrame:
+    """Ajoute year / quarter / time_idx a un DataFrame.
 
-try:
-    df = df_model.copy()
-    print(f"\nBase reprise depuis `df_model` : {len(df):,} lignes | "
-          f"{df.shape[1]} colonnes")
-except NameError:
-    df = pd.read_csv(CHEMIN_DONNEES)
-    print(f"\nBase chargee depuis {CHEMIN_DONNEES} : {len(df):,} lignes | "
-          f"{df.shape[1]} colonnes")
+    annee_ref DOIT etre la meme pour tous les DataFrames que l'on compte
+    joindre ensuite. Si chacun utilise son propre min(), les time_idx sont
+    decales l'un par rapport a l'autre et la jointure echoue silencieusement.
+    """
+    f = frame.copy()
 
-# --- construction de l'index temporel ---------------------------------------
-df["year"] = pd.to_numeric(df[COL_ANNEE], errors="coerce").astype("Int64")
+    if "year" in f.columns:
+        f["year"] = f["year"].astype(int)
+    elif "annee" in f.columns:
+        f["year"] = f["annee"].astype(int)
+    else:
+        raise KeyError("Ni 'year' ni 'annee' : periode impossible a reconstruire.")
 
-if "quarter" not in df.columns:
-    df["quarter"] = df[COL_TIME].astype(str).str.strip().str.upper().map(QUARTER_MAP)
+    if "quarter" in f.columns:
+        f["quarter"] = f["quarter"].astype(int)
+    elif "Time" in f.columns:
+        q = f["Time"].astype(str).str.strip().str.upper().map(QUARTER_MAP)
+        if q.isna().any():
+            raise ValueError(
+                f"Valeurs de 'Time' non reconnues : "
+                f"{f.loc[q.isna(), 'Time'].unique()[:5].tolist()}")
+        f["quarter"] = q.astype(int)
+    else:
+        raise KeyError("Ni 'quarter' ni 'Time' : periode impossible a reconstruire.")
 
-df = df.dropna(subset=["year", "quarter"]).copy()
-df["year"]    = df["year"].astype(int)
-df["quarter"] = df["quarter"].astype(int)
+    ref = f["year"].min() if annee_ref is None else annee_ref
+    f["time_idx"] = (f["year"] - ref) * 4 + f["quarter"]
+    return f
 
-# time_idx : entier croissant continu, 1 unite = 1 trimestre
-df["time_idx"] = df["year"] * 4 + df["quarter"]
 
-def idx_de(annee_trim):
-    """Convertit un couple (annee, trimestre) en time_idx."""
-    a, q = annee_trim
-    return a * 4 + q
+df = construire_time_idx(df_model.copy())
+ANNEE_REF = int(df["year"].min())          # reference partagee, a reutiliser tel quel
+
+n_avant = len(df)
+for an, tr in EXCLURE_PERIODES:
+    df = df[~((df["year"] == an) & (df["quarter"] == tr))]
+print(f"Periodes ecartees {EXCLURE_PERIODES} : {n_avant - len(df):,} lignes retirees")
 
 df = df.sort_values("time_idx").reset_index(drop=True)
 
-# --- profil de la cible ------------------------------------------------------
-y_all = pd.to_numeric(df[TARGET], errors="coerce")
-n_neg = int((y_all < 0).sum())
-n_nan = int(y_all.isna().sum())
+ID_COLS = [c for c in ID_COLS_BRUTS if c in df.columns]
 
-print("\n" + "-" * 78)
-print("PROFIL DE LA CIBLE")
-print(f"  n             : {len(y_all):,}")
-print(f"  NaN           : {n_nan:,}")
-print(f"  valeurs < 0   : {n_neg:,}  ({n_neg / len(y_all):.2%})")
-print(f"  valeurs = 0   : {int((y_all == 0).sum()):,}")
-print(f"  min / max     : {y_all.min():,.2f}  /  {y_all.max():,.2f}")
-for q in (25, 50, 75, 90, 99):
-    print(f"  P{q:<12} : {np.nanpercentile(y_all.dropna(), q):,.2f}")
-print(f"  asymetrie     : {y_all.skew():,.2f}")
-
-# La loi Tweedie (1 < p < 2) est definie sur [0, +inf[ : les valeurs negatives
-# sont ecretees. LightGBM le fait implicitement, on l'explicite ici.
-if n_neg:
-    print(f"\n  !! {n_neg:,} valeurs negatives ecretees a 0 (contrainte du support Tweedie).")
-    print("     A documenter dans les limites du memoire.")
-df[TARGET] = y_all.clip(lower=0)
-df = df.dropna(subset=[TARGET]).reset_index(drop=True)
-
-print("\n  Periodes presentes dans la base :")
-periodes = (df.groupby(["year", "quarter"]).size()
-            .reset_index(name="n").sort_values(["year", "quarter"]))
-print(periodes.to_string(index=False))
+apercu = (df.groupby(["year", "quarter", "time_idx"], as_index=False)
+            .agg(n_lignes=(TARGET, "size"), n_cible_nan=(TARGET, lambda s: s.isna().sum()))
+            .sort_values("time_idx"))
+apercu["pct_nan"] = (apercu["n_cible_nan"] / apercu["n_lignes"]).map("{:.1%}".format)
+print("\nPeriodes disponibles (surveiller la colonne pct_nan) :")
+print(apercu.to_string(index=False))
 
 
-# =============================================================================
-# BLOC 2 - DECOUPAGE TRAIN / CALIBRATION / TEST
-# -----------------------------------------------------------------------------
-#  Le jeu de CALIBRATION doit etre disjoint du jeu d'entrainement. S'il ne
-#  l'est pas, les residus de calibration sont artificiellement petits, le
-#  quantile conforme est sous-estime, et la garantie de couverture tombe
-#  silencieusement : le modele parait fiable alors qu'il ne l'est pas.
-# =============================================================================
-m_train = (df["time_idx"] >= idx_de(TRAIN_DEBUT)) & (df["time_idx"] <= idx_de(TRAIN_FIN))
-m_cal   = df["time_idx"] == idx_de(CALIBRATION)
-m_test  = df["time_idx"] == idx_de(TEST)
-
-df_train, df_cal, df_test = df[m_train].copy(), df[m_cal].copy(), df[m_test].copy()
-
-print("\n" + "=" * 78)
-print("DECOUPAGE TEMPOREL")
-print("=" * 78)
-print(f"  TRAIN        {TRAIN_DEBUT[0]}Q{TRAIN_DEBUT[1]} -> {TRAIN_FIN[0]}Q{TRAIN_FIN[1]}"
-      f"   : {len(df_train):>7,} lignes  ({df_train['time_idx'].nunique()} trimestres)")
-print(f"  CALIBRATION  {CALIBRATION[0]}Q{CALIBRATION[1]}"
-      f"                : {len(df_cal):>7,} lignes")
-print(f"  TEST         {TEST[0]}Q{TEST[1]}"
-      f"                : {len(df_test):>7,} lignes")
-
-for nom, d in (("TRAIN", df_train), ("CALIBRATION", df_cal), ("TEST", df_test)):
-    if d.empty:
-        raise ValueError(f"Le jeu {nom} est vide : verifier les bornes du decoupage.")
-
-if len(df_cal) < 100:
-    print(f"\n  !! Calibration de seulement {len(df_cal)} lignes.")
-    print("     Le quantile conforme sera instable. Envisager d'elargir la calibration.")
-
-# Verification que la cible reste comparable entre les trois jeux : une derive
-# forte remet en cause l'hypothese d'echangeabilite sur laquelle repose la
-# garantie conforme.
-print("\n  Distribution de la cible par jeu (test d'echangeabilite informel) :")
-comp_jeux = pd.DataFrame({
-    nom: [d[TARGET].mean(), d[TARGET].median(), d[TARGET].std(),
-          d[TARGET].quantile(0.90)]
-    for nom, d in (("TRAIN", df_train), ("CALIBRATION", df_cal), ("TEST", df_test))
-}, index=["moyenne", "mediane", "ecart-type", "P90"])
-print(comp_jeux.round(2).to_string())
-print("\n  Un ecart marque entre CALIBRATION et TEST annonce une degradation")
-print("  de la couverture : l'echangeabilite est alors mise en defaut.")
-
-
-# =============================================================================
-# BLOC 3 - PREPROCESSING PARTAGE
-# -----------------------------------------------------------------------------
-#  Les trois modeles recoivent EXACTEMENT la meme matrice de design. C'est la
-#  condition pour que la comparaison porte sur l'algorithme et non sur des
-#  encodages differents. Sans cela, un ecart de performance est ininterpretable.
+# %% ==========================================================================
+#  CELLULE 2 - IMPORT DES PREDICTIONS LightGBM DE L'AUTRE NOTEBOOK
 #
-#  Tout est appris sur le TRAIN seul, puis applique tel quel a CALIBRATION
-#  et TEST. Apprendre l'encodage sur l'ensemble des donnees injecterait de
-#  l'information future.
+#  ORDRE CRITIQUE : la jointure se fait ICI, sur les identifiants D'ORIGINE,
+#  AVANT l'anonymisation de la cellule 3. Joindre apres coup ne peut pas
+#  marcher : df porterait "PART_01" et l'artefact le libelle reel.
 # =============================================================================
-cat_cols = [c for c in ID_COLS if c in df.columns]
-exclure  = set([TARGET, "time_idx", "year", "quarter", COL_ANNEE, COL_TIME]
-               + cat_cols + LEAK_COLS)
-num_cols = [c for c in df.select_dtypes(include=[np.number]).columns
-            if c not in exclure]
-
-print("\n" + "=" * 78)
-print("PREPROCESSING")
-print("=" * 78)
-print(f"  Variables numeriques   : {len(num_cols)}")
-print(f"  Variables categorielles: {cat_cols}")
-
-
-def log_signe(x):
-    """Transformation log preservant le signe : comprime les queues lourdes."""
-    x = np.asarray(x, float)
-    return np.sign(x) * np.log1p(np.abs(x))
-
-
-def ajuster_preprocessing(df_tr, num_cols, cat_cols, min_count=MIN_MODALITE):
-    """Apprend medianes d'imputation et modalites conservees SUR LE TRAIN."""
-    medianes = df_tr[num_cols].replace([np.inf, -np.inf], np.nan).median() \
-        if num_cols else pd.Series(dtype=float)
-    modalites = {}
-    for c in cat_cols:
-        vc = df_tr[c].astype(str).value_counts()
-        modalites[c] = set(vc[vc >= min_count].index)
-    return dict(medianes=medianes, modalites=modalites,
-                num_cols=num_cols, cat_cols=cat_cols)
-
-
-def appliquer_preprocessing(df_x, prep, colonnes_ref=None):
-    """Construit la matrice de design a partir des parametres appris."""
-    blocs = []
-
-    if prep["num_cols"]:
-        X_num = df_x[prep["num_cols"]].replace([np.inf, -np.inf], np.nan)
-        X_num = X_num.fillna(prep["medianes"]).fillna(0.0)
-        X_num = pd.DataFrame(log_signe(X_num.to_numpy()),
-                             columns=[f"log_{c}" for c in prep["num_cols"]],
-                             index=df_x.index)
-        blocs.append(X_num)
-
-    for c in prep["cat_cols"]:
-        s = df_x[c].astype(str)
-        s = s.where(s.isin(prep["modalites"][c]), "AUTRE")
-        blocs.append(pd.get_dummies(s, prefix=c, drop_first=True, dtype=float))
-
-    X = pd.concat(blocs, axis=1) if blocs else pd.DataFrame(index=df_x.index)
-
-    # alignement strict : le test doit avoir les memes colonnes que le train
-    if colonnes_ref is not None:
-        X = X.reindex(columns=colonnes_ref, fill_value=0.0)
-    return X
-
-
-prep = ajuster_preprocessing(df_train, num_cols, cat_cols)
-
-X_train = appliquer_preprocessing(df_train, prep)
-# colonnes constantes : inutiles pour les arbres, fatales pour le GLM
-X_train = X_train.loc[:, X_train.std() > 1e-12]
-COLONNES = X_train.columns
-
-X_cal  = appliquer_preprocessing(df_cal,  prep, colonnes_ref=COLONNES)
-X_test = appliquer_preprocessing(df_test, prep, colonnes_ref=COLONNES)
-
-y_train = df_train[TARGET].to_numpy(float)
-y_cal   = df_cal[TARGET].to_numpy(float)
-y_test  = df_test[TARGET].to_numpy(float)
-
-print(f"  Matrice de design      : {X_train.shape[1]} colonnes")
-print(f"    train {X_train.shape} | calibration {X_cal.shape} | test {X_test.shape}")
-
-
-# =============================================================================
-# BLOC 4 - ENTRAINEMENT DES TROIS MODELES
-# -----------------------------------------------------------------------------
-#  Meme famille de loi (Tweedie), meme puissance de variance, memes donnees.
-#  Seul l'algorithme change :
-#    GLM       : forme multiplicative imposee a priori, coefficients lisibles
-#    LightGBM  : arbres, croissance feuille par feuille (leaf-wise)
-#    XGBoost   : arbres, croissance niveau par niveau (level-wise)
-# =============================================================================
-print("\n" + "=" * 78)
-print("ENTRAINEMENT DES MODELES")
-print("=" * 78)
-
-modeles, predictions = {}, {}
-
-# --- 1. LightGBM -------------------------------------------------------------
-print("\n[1/3] LightGBM Tweedie ...")
-m_lgb = lgb.LGBMRegressor(
-    objective="tweedie", tweedie_variance_power=TWEEDIE_POWER,
-    n_estimators=800, learning_rate=0.03, num_leaves=31,
-    min_child_samples=100, colsample_bytree=0.8,
-    subsample=0.8, subsample_freq=1,
-    reg_alpha=0.1, reg_lambda=5.0,
-    random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
-m_lgb.fit(X_train, y_train)
-modeles["LightGBM"] = m_lgb
-predictions["LightGBM"] = np.clip(m_lgb.predict(X_test), 0, None)
-print(f"      termine ({m_lgb.n_estimators_} arbres)")
-
-# --- 2. XGBoost --------------------------------------------------------------
-print("[2/3] XGBoost Tweedie ...")
-m_xgb = xgb.XGBRegressor(
-    objective="reg:tweedie", tweedie_variance_power=TWEEDIE_POWER,
-    n_estimators=800, learning_rate=0.03, max_depth=6,
-    min_child_weight=10, colsample_bytree=0.8, subsample=0.8,
-    reg_alpha=0.1, reg_lambda=5.0, tree_method="hist",
-    random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)
-m_xgb.fit(X_train, y_train)
-modeles["XGBoost"] = m_xgb
-predictions["XGBoost"] = np.clip(m_xgb.predict(X_test), 0, None)
-print("      termine")
-
-# --- 3. GLM Tweedie ----------------------------------------------------------
-#  Garde-fou : au-dela de GLM_MAX_FEATURES colonnes, l'estimation par maximum
-#  de vraisemblance devient instable (colinearite, non-convergence). On
-#  restreint alors au sous-ensemble le plus correle a la cible. Ce choix est
-#  un parti pris methodologique a assumer dans le memoire.
-print("[3/3] GLM Tweedie (statsmodels) ...")
-
-cols_glm = COLONNES
-if len(COLONNES) > GLM_MAX_FEATURES:
-    corr = (X_train.corrwith(pd.Series(y_train, index=X_train.index)).abs()
-            .replace([np.inf, -np.inf], np.nan).dropna()
-            .sort_values(ascending=False))
-    cols_glm = corr.head(GLM_MAX_FEATURES).index
-    print(f"      design reduit de {len(COLONNES)} a {len(cols_glm)} colonnes "
-          f"(garde-fou de convergence)")
-
-Xg_train = sm.add_constant(X_train[cols_glm], has_constant="add")
-Xg_test  = sm.add_constant(X_test[cols_glm],  has_constant="add")
-Xg_cal   = sm.add_constant(X_cal[cols_glm],   has_constant="add")
-
-famille = sm.families.Tweedie(link=sm.families.links.Log(),
-                              var_power=TWEEDIE_POWER)
-res_glm = sm.GLM(y_train, Xg_train, family=famille).fit(maxiter=100, tol=1e-8)
-
-modeles["GLM"] = res_glm
-predictions["GLM"] = np.clip(res_glm.predict(Xg_test).to_numpy(float), 0, None)
-
-print(f"      convergence : {res_glm.converged}")
-print(f"      deviance/ddl: {res_glm.deviance / res_glm.df_resid:,.3f}"
-      f"   (>> 1 = surdispersion residuelle)")
-print(f"      AIC         : {res_glm.aic:,.1f}")
-if not res_glm.converged:
-    print("      !! NON CONVERGE : baisser GLM_MAX_FEATURES ou monter MIN_MODALITE.")
-
-# --- table des coefficients (l'argument d'interpretabilite) ------------------
-coefs_glm = pd.DataFrame({
-    "coef": res_glm.params, "std_err": res_glm.bse,
-    "z": res_glm.tvalues, "p_value": res_glm.pvalues,
-})
-coefs_glm["effet_multiplicatif"] = np.exp(coefs_glm["coef"])
-coefs_glm = coefs_glm[coefs_glm.index != "const"].sort_values("p_value")
-
-print("\n  GLM - 10 variables les plus significatives")
-print("  " + "-" * 74)
-apercu = coefs_glm.head(10).copy()
-apercu["p_value"] = apercu["p_value"].map(lambda v: f"{v:.2e}")
-print(apercu[["coef", "std_err", "p_value", "effet_multiplicatif"]]
-      .round(4).to_string())
-n_signif = int((coefs_glm["p_value"] < 0.05).sum())
-print(f"\n  Significatives a 5 % : {n_signif} / {len(coefs_glm)}")
-
-
-# =============================================================================
-# BLOC 5 - EVALUATION COMPARATIVE
-# -----------------------------------------------------------------------------
-#  La MAE seule est trompeuse sur une cible a queue lourde : elle agrege des
-#  regimes tres differents. On y adjoint donc :
-#    - un baseline trivial (mediane) que le modele doit battre nettement
-#    - le bilan somme(predit)/somme(reel), qui revele un biais systematique
-#    - une decomposition par strate, qui localise l'echec
-#    - le Gini, qui mesure le pouvoir de TRI (essentiel pour prioriser)
-# =============================================================================
-def gini(y_true, y_pred):
-    o = np.argsort(y_pred)
-    cum = np.cumsum(y_true[o]) / y_true.sum()
-    return 1 - 2 * np.trapz(cum, np.linspace(0, 1, len(cum)))
-
-
-def evaluer(y_true, y_pred):
-    ok = np.isfinite(y_true) & np.isfinite(y_pred)
-    yt, yp = y_true[ok], y_pred[ok]
-    base = np.full_like(yt, np.median(yt))
-    return dict(
-        MAE=mean_absolute_error(yt, yp),
-        RMSE=float(np.sqrt(np.mean((yt - yp) ** 2))),
-        MAE_baseline=mean_absolute_error(yt, base),
-        gain_vs_baseline=1 - mean_absolute_error(yt, yp) / mean_absolute_error(yt, base),
-        bilan_somme=yp.sum() / yt.sum(),
-        Gini=gini(yt, yp),
-    )
-
-
-resultats = pd.DataFrame({n: evaluer(y_test, p) for n, p in predictions.items()}).T
-resultats = resultats.sort_values("MAE")
-
-print("\n" + "=" * 78)
-print(f"EVALUATION SUR LE TEST ({TEST[0]}Q{TEST[1]}, {len(df_test):,} observations)")
-print("=" * 78)
-print(resultats.round(4).to_string())
-
-meilleur = resultats.index[0]
-print(f"\n  Meilleure MAE : {meilleur}")
-for autre in resultats.index[1:]:
-    ecart = (resultats.loc[autre, "MAE"] - resultats.loc[meilleur, "MAE"]) \
-            / resultats.loc[autre, "MAE"]
-    print(f"    gain sur {autre:<10} : {ecart:>6.1%}")
-
-# --- decomposition par strate ------------------------------------------------
-edges  = [-np.inf] + [np.percentile(y_test, q) for q in (50, 90, 99)] + [np.inf]
-labels = ["P0-50", "P50-90", "P90-99", "P99+"]
-strate = pd.cut(y_test, bins=edges, labels=labels)
-
-print("\n  MAE PAR STRATE DE CIBLE")
-print("  " + "-" * 62)
-mae_strate = pd.DataFrame(
-    {n: [mean_absolute_error(y_test[(strate == l).to_numpy()],
-                             p[(strate == l).to_numpy()])
-         if (strate == l).sum() else np.nan for l in labels]
-     for n, p in predictions.items()}, index=labels)
-mae_strate["n"] = [int((strate == l).sum()) for l in labels]
-print(mae_strate.round(0).to_string())
-print("\n  Un modele qui gagne globalement mais perd sur P99+ est un mauvais")
-print("  choix pour la validation comptable : c'est la que se logent les")
-print("  anomalies les plus couteuses.")
-
-
-# =============================================================================
-# BLOC 6 - VISUALISATIONS COMPARATIVES  (4 graphiques, tous exploitables)
-# =============================================================================
-COULEURS = {"LightGBM": "darkgreen", "XGBoost": "darkorange", "GLM": "steelblue"}
-
-fig, ax = plt.subplots(2, 2, figsize=(15, 11))
-fig.suptitle(f"Comparaison des modeles - test {TEST[0]}Q{TEST[1]}",
-             fontsize=15, fontweight="bold")
-
-# 1 - predit vs reel
-for nom, p in predictions.items():
-    m = (y_test > 0) & (p > 0)
-    ax[0, 0].scatter(y_test[m], p[m], s=6, alpha=.3,
-                     color=COULEURS.get(nom, "gray"), label=nom)
-mm = (y_test > 0)
-lim = [y_test[mm].min(), y_test[mm].max()]
-ax[0, 0].plot(lim, lim, "r--", lw=1.5, label="y = x")
-ax[0, 0].set_xscale("log"); ax[0, 0].set_yscale("log")
-ax[0, 0].set_xlabel("valeur reelle"); ax[0, 0].set_ylabel("valeur predite")
-ax[0, 0].set_title("1. Predit vs Reel")
-ax[0, 0].legend(markerscale=2)
-
-# 2 - MAE par strate
-x = np.arange(len(labels)); w = 0.8 / len(predictions)
-for i, nom in enumerate(predictions):
-    ax[0, 1].bar(x + i * w, mae_strate[nom], w, label=nom,
-                 color=COULEURS.get(nom, "gray"))
-ax[0, 1].set_xticks(x + w * (len(predictions) - 1) / 2)
-ax[0, 1].set_xticklabels(labels)
-ax[0, 1].set_yscale("log")
-ax[0, 1].set_ylabel("MAE")
-ax[0, 1].set_title("2. MAE par strate de cible")
-ax[0, 1].legend()
-
-# 3 - courbes de Lorenz : pouvoir de tri
-for nom, p in predictions.items():
-    o = np.argsort(p)
-    cum = np.cumsum(y_test[o]) / y_test.sum()
-    xs = np.linspace(0, 1, len(cum))
-    ax[1, 0].plot(xs, cum, lw=2, color=COULEURS.get(nom, "gray"),
-                  label=f"{nom} (Gini={gini(y_test, p):.3f})")
-ax[1, 0].plot([0, 1], [0, 1], "r--", lw=1.2, label="aleatoire")
-ax[1, 0].set_xlabel("part des observations (triees par prediction)")
-ax[1, 0].set_ylabel("part cumulee de la cible")
-ax[1, 0].set_title("3. Courbe de Lorenz - pouvoir de tri")
-ax[1, 0].legend()
-
-# 4 - importance des variables (LightGBM, top 15)
-imp = (pd.DataFrame({"feature": X_train.columns,
-                     "gain": m_lgb.booster_.feature_importance("gain")})
-       .sort_values("gain", ascending=False).head(15).iloc[::-1])
-imp["gain_%"] = 100 * imp["gain"] / m_lgb.booster_.feature_importance("gain").sum()
-ax[1, 1].barh(imp["feature"], imp["gain_%"], color="darkgreen")
-ax[1, 1].set_xlabel("part du gain total (%)")
-ax[1, 1].set_title("4. Variables les plus explicatives (LightGBM)")
-ax[1, 1].tick_params(axis="y", labelsize=8)
-
-plt.tight_layout()
-plt.show()
-
-
-# =============================================================================
-# BLOC 7 - SPLIT CONFORMAL PREDICTION
-# -----------------------------------------------------------------------------
-#  Principe : le modele de base fournit une prediction ponctuelle ; la
-#  calibration fournit la loi empirique des ecarts ; le quantile de cette loi
-#  donne la marge a ajouter pour garantir la couverture.
-#
-#  GARANTIE (Vovk et al. 2005) : sous echangeabilite entre calibration et test,
-#      P( Y_test dans C(X_test) ) >= 1 - alpha
-#  Cette garantie est MARGINALE. Rien n'assure qu'elle tienne sur un
-#  sous-groupe donne (Barber et al. 2021) : d'ou le BLOC 8.
-#
-#  TROIS VARIANTES, et la premiere est indispensable a la demonstration :
-#    A - absolu     : largeur CONSTANTE -> reproduit la limite du seuil fixe
-#    B - normalise  : largeur proportionnelle a la difficulte locale sigma(x)
-#    C - CQR        : largeur issue de deux regressions quantiles
-# =============================================================================
-MODELE_BASE = meilleur       # le meilleur des trois sert de modele de base
-
-print("\n" + "=" * 78)
-print(f"SPLIT CONFORMAL PREDICTION - modele de base : {MODELE_BASE}")
-print(f"Calibration {CALIBRATION[0]}Q{CALIBRATION[1]} ({len(df_cal):,} obs) "
-      f"| Test {TEST[0]}Q{TEST[1]} ({len(df_test):,} obs) | alpha = {ALPHA}")
-print("=" * 78)
-
-
-def predire(nom, X, X_glm=None):
-    """Prediction du modele designe, ecretee a 0."""
-    if nom == "GLM":
-        return np.clip(modeles["GLM"].predict(X_glm).to_numpy(float), 0, None)
-    return np.clip(modeles[nom].predict(X), 0, None)
-
-
-def quantile_conforme(scores, alpha):
-    """Quantile conforme avec CORRECTION D'ECHANTILLON FINI.
-
-    Le rang est ceil((n+1)(1-alpha))/n et non le quantile (1-alpha) classique.
-    C'est cette correction qui rend la garantie valable pour tout n fini.
-    L'omettre produit une sous-couverture systematique et silencieuse.
-
-    Retourne +inf si n est trop petit pour garantir le niveau demande : un
-    intervalle non informatif est preferable a une fausse assurance.
-    """
-    s = np.asarray(scores, float)
-    s = s[np.isfinite(s)]
-    n = len(s)
-    if n == 0:
-        return np.inf
-    niveau = np.ceil((n + 1) * (1 - alpha)) / n
-    if niveau > 1:
-        print(f"    !! n={n} trop petit pour garantir 1-alpha={1 - alpha:.2f}")
-        return np.inf
-    return float(np.quantile(s, niveau, method="higher"))
-
-
-def construire_intervalles(alpha, verbose=True):
-    """Construit les intervalles des trois variantes conformes."""
-    pred_cal  = predire(MODELE_BASE, X_cal,  Xg_cal)
-    pred_test = predire(MODELE_BASE, X_test, Xg_test)
-    pred_tr   = predire(MODELE_BASE, X_train, Xg_train)
-    out = {}
-
-    # ---------- A : split conformal absolu (largeur constante) --------------
-    s_abs = np.abs(y_cal - pred_cal)
-    q_abs = quantile_conforme(s_abs, alpha)
-    out["A_absolu"] = (np.clip(pred_test - q_abs, 0, None), pred_test + q_abs)
-
-    # ---------- B : split conformal normalise (largeur variable) ------------
-    #  sigma(x) est estime sur le TRAIN en modelisant log1p(|residu|).
-    #  C'est lui qui rend l'intervalle adaptatif : un sous-portefeuille
-    #  historiquement volatil recoit une marge plus large, un sous-portefeuille
-    #  stable une marge plus etroite. C'est la reponse directe a la critique
-    #  du seuil fixe formulee au chapitre 1.
-    m_sigma = lgb.LGBMRegressor(
-        objective="regression", n_estimators=400, learning_rate=0.05,
-        num_leaves=31, min_child_samples=100,
-        random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
-    m_sigma.fit(X_train, np.log1p(np.abs(y_train - pred_tr)))
-
-    sigma_cal  = np.clip(np.expm1(m_sigma.predict(X_cal)),  1e-6, None)
-    sigma_test = np.clip(np.expm1(m_sigma.predict(X_test)), 1e-6, None)
-
-    q_norm = quantile_conforme(np.abs(y_cal - pred_cal) / sigma_cal, alpha)
-    out["B_normalise"] = (np.clip(pred_test - q_norm * sigma_test, 0, None),
-                          pred_test + q_norm * sigma_test)
-
-    # ---------- C : CQR (Romano, Patterson, Candes 2019) --------------------
-    par_q = dict(objective="quantile", n_estimators=400, learning_rate=0.05,
-                 num_leaves=31, min_child_samples=100,
-                 random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
-    q_lo = lgb.LGBMRegressor(**par_q, alpha=alpha / 2).fit(X_train, y_train)
-    q_hi = lgb.LGBMRegressor(**par_q, alpha=1 - alpha / 2).fit(X_train, y_train)
-
-    lo_cal,  hi_cal  = q_lo.predict(X_cal),  q_hi.predict(X_cal)
-    lo_test, hi_test = q_lo.predict(X_test), q_hi.predict(X_test)
-
-    # score CQR : depassement du cote le plus contraignant
-    s_cqr = np.maximum(lo_cal - y_cal, y_cal - hi_cal)
-    q_cqr = quantile_conforme(s_cqr, alpha)
-    out["C_cqr"] = (np.clip(lo_test - q_cqr, 0, None), hi_test + q_cqr)
-
-    if verbose:
-        print(f"\n  Quantiles conformes (n_cal = {len(y_cal):,})")
-        print(f"    A absolu    : {q_abs:>16,.2f}   (marge fixe, identique pour tous)")
-        print(f"    B normalise : {q_norm:>16,.4f}   (multiplicateur de sigma)")
-        print(f"    C cqr       : {q_cqr:>16,.2f}   (correction des quantiles)")
-        print(f"    sigma test  : mediane {np.median(sigma_test):,.2f} | "
-              f"P10 {np.percentile(sigma_test, 10):,.2f} | "
-              f"P90 {np.percentile(sigma_test, 90):,.2f}")
-
-    return out, pred_test, sigma_test
-
-
-intervalles, pred_test_base, sigma_test = construire_intervalles(ALPHA)
-
-# --- assemblage du tableau de resultats -------------------------------------
-conf = df_test[[c for c in cat_cols if c in df_test.columns]].reset_index(drop=True)
-conf["year_quarter"]   = f"{TEST[0]}Q{TEST[1]}"
-conf["Valeur_reelle"]  = y_test
-conf["Valeur_predite"] = pred_test_base
-conf["sigma"]          = sigma_test
-conf["strate"]         = strate
-
-METHODES = [("A_absolu",    "A - absolu (largeur constante)"),
-            ("B_normalise", "B - normalise (largeur variable)"),
-            ("C_cqr",       "C - CQR (largeur variable)")]
-
-for cle, _ in METHODES:
-    lo, hi = intervalles[cle]
-    conf[f"lo_{cle}"]      = lo
-    conf[f"hi_{cle}"]      = hi
-    conf[f"largeur_{cle}"] = hi - lo
-    conf[f"couvert_{cle}"] = ((y_test >= lo) & (y_test <= hi)).astype(int)
-
-
-# =============================================================================
-# BLOC 8 - VALIDITE, EFFICACITE ET COUVERTURE CONDITIONNELLE
-# -----------------------------------------------------------------------------
-#  Deux criteres indissociables :
-#    VALIDITE   la couverture empirique atteint-elle 1 - alpha ?
-#    EFFICACITE l'intervalle est-il assez etroit pour etre exploitable ?
-#  Un intervalle [0, +inf[ couvre a 100 % et ne sert a rien.
-# =============================================================================
-lignes = []
-for cle, nom in METHODES:
-    larg = conf[f"largeur_{cle}"]
-    couv = conf[f"couvert_{cle}"].mean()
-    lignes.append({
-        "methode": nom,
-        "couverture": couv,
-        "ecart_cible": couv - (1 - ALPHA),
-        "largeur_moyenne": larg.mean(),
-        "largeur_mediane": larg.median(),
-        "cv_largeur": larg.std() / larg.mean() if larg.mean() else 0.0,
-        "n_signales": int((1 - conf[f"couvert_{cle}"]).sum()),
-    })
-resume_conf = pd.DataFrame(lignes)
-
-print("\n" + "=" * 78)
-print(f"VALIDITE ET EFFICACITE - couverture visee {1 - ALPHA:.0%}")
-print("=" * 78)
-for _, r in resume_conf.iterrows():
-    statut = "OK" if r["ecart_cible"] >= -0.02 else "SOUS-COUVERTURE"
-    print(f"\n  {r['methode']}")
-    print(f"    couverture empirique : {r['couverture']:>9.2%}   ({statut})")
-    print(f"    ecart a la cible     : {r['ecart_cible']:>+9.2%}")
-    print(f"    largeur mediane      : {r['largeur_mediane']:>13,.0f}")
-    print(f"    coef. de variation   : {r['cv_largeur']:>9.3f}")
-    print(f"    observations hors IC : {r['n_signales']:>13,}")
-
-print("\n" + "-" * 78)
-print("  LECTURE DU COEFFICIENT DE VARIATION DE LA LARGEUR")
-print("  Proche de 0  -> l'intervalle est identique pour tous les")
-print("                  sous-portefeuilles : c'est exactement la limite du")
-print("                  seuil fixe denoncee au chapitre 1.")
-print("  Nettement > 0 -> l'intervalle s'adapte au contexte de chaque")
-print("                  sous-portefeuille : la critique est levee.")
-print("-" * 78)
-
-# --- couverture conditionnelle : le point challengeable en soutenance -------
-def couverture_par(colonne, min_n=20, top=10):
-    res = []
-    for mod, g in conf.groupby(colonne, observed=True):
-        if len(g) < min_n:
-            continue
-        d = {colonne: str(mod), "n": len(g)}
-        for cle, _ in METHODES:
-            d[f"couv_{cle}"] = g[f"couvert_{cle}"].mean()
-        res.append(d)
-    if not res:
-        return pd.DataFrame()
-    return (pd.DataFrame(res).sort_values("n", ascending=False)
-            .head(top).reset_index(drop=True))
-
-
-print("\n" + "=" * 78)
-print("COUVERTURE CONDITIONNELLE (garantie marginale, Barber et al. 2021)")
-print("=" * 78)
-
-cc_strate = couverture_par("strate")
-print("\n  Par strate de cible :")
-print(cc_strate.round(4).to_string(index=False))
-print("\n  Une couverture qui s'effondre sur P99+ signifie que les valeurs")
-print("  extremes ne sont pas protegees - la ou la validation en a le plus besoin.")
-
-cc_metier = {}
-for col in cat_cols:
-    cc = couverture_par(col)
-    if not cc.empty:
-        cc_metier[col] = cc
-        print(f"\n  Par {col} :")
-        print(cc.round(4).to_string(index=False))
-
-
-# =============================================================================
-# BLOC 9 - PRIORISATION DES SOUS-PORTEFEUILLES ATYPIQUES
-# -----------------------------------------------------------------------------
-#  Sortir de l'intervalle est un signal binaire. Les equipes de validation ont
-#  un temps fini : il faut ORDONNER les signaux.
-#
-#      severite = depassement / largeur de l'intervalle
-#
-#  Rapporter le depassement a la largeur rend les signaux comparables entre
-#  sous-portefeuilles de tailles tres differentes : un ecart de 50 kEUR sur un
-#  perimetre stable pese plus qu'un ecart de 500 kEUR sur un perimetre
-#  historiquement volatil. C'est la reponse operationnelle a l'hypothese H3.
-# =============================================================================
-CLE_RETENUE = "C_cqr"
-
-lo = conf[f"lo_{CLE_RETENUE}"].to_numpy(float)
-hi = conf[f"hi_{CLE_RETENUE}"].to_numpy(float)
-largeur = np.maximum(hi - lo, 1e-9)
-
-conf["depassement"] = np.where(y_test > hi, y_test - hi,
-                        np.where(y_test < lo, lo - y_test, 0.0))
-conf["severite"]    = conf["depassement"] / largeur
-conf["sens_ecart"]  = np.where(y_test > hi, "au-dessus de l'attendu",
-                        np.where(y_test < lo, "en-dessous de l'attendu", "conforme"))
-
-signaux = (conf[conf["severite"] > 0]
-           .sort_values("severite", ascending=False).reset_index(drop=True))
-
-print("\n" + "=" * 78)
-print(f"PRIORISATION DES SIGNAUX - variante {CLE_RETENUE}")
-print("=" * 78)
-print(f"  Observations testees : {len(conf):,}")
-print(f"  Signaux (hors IC)    : {len(signaux):,}  ({len(signaux) / len(conf):.2%})")
-print(f"  Attendu theorique    : {ALPHA:.2%}")
-
-if len(signaux):
-    cols_aff = ([c for c in cat_cols if c in signaux.columns]
-                + ["Valeur_reelle", "Valeur_predite",
-                   f"lo_{CLE_RETENUE}", f"hi_{CLE_RETENUE}",
-                   "depassement", "severite", "sens_ecart"])
-    print("\n  TOP 15 A INVESTIGUER EN PRIORITE")
-    print("  " + "-" * 74)
-    print(signaux[cols_aff].head(15).round(2).to_string(index=False))
-
-    if cat_cols:
-        axe = cat_cols[0]
-        conc = (signaux.groupby(axe)
-                .agg(n_signaux=("severite", "size"),
-                     severite_moy=("severite", "mean"),
-                     severite_max=("severite", "max"))
-                .sort_values("n_signaux", ascending=False).head(10))
-        print(f"\n  CONCENTRATION DES SIGNAUX PAR {axe.upper()}")
-        print("  " + "-" * 74)
-        print(conc.round(3).to_string())
-
-
-# =============================================================================
-# BLOC 10 - VISUALISATIONS CONFORMES  (6 graphiques, tous exploitables)
-# =============================================================================
-C_METH = {"A_absolu": "indianred", "B_normalise": "steelblue", "C_cqr": "darkgreen"}
-
-fig, ax = plt.subplots(2, 3, figsize=(19, 11))
-fig.suptitle(f"Split Conformal Prediction - test {TEST[0]}Q{TEST[1]} "
-             f"(alpha = {ALPHA})", fontsize=15, fontweight="bold")
-
-# 1 - validite : couverture atteinte
-noms  = [c.split("_")[0] for c, _ in METHODES]
-couvs = [conf[f"couvert_{c}"].mean() for c, _ in METHODES]
-b = ax[0, 0].bar(noms, couvs, color=[C_METH[c] for c, _ in METHODES])
-ax[0, 0].axhline(1 - ALPHA, color="k", ls="--", lw=2, label=f"cible {1 - ALPHA:.0%}")
-ax[0, 0].set_ylim(min(couvs) - 0.1, 1.03)
-ax[0, 0].set_ylabel("couverture empirique")
-ax[0, 0].set_title("1. Validite")
-ax[0, 0].legend()
-for bb, v in zip(b, couvs):
-    ax[0, 0].text(bb.get_x() + bb.get_width() / 2, v + 0.005,
-                  f"{v:.1%}", ha="center", fontsize=10)
-
-# 2 - efficacite : distribution des largeurs (LE graphique du memoire)
-for cle, _ in METHODES:
-    l = conf[f"largeur_{cle}"]
-    l = l[l > 0]
-    ax[0, 1].hist(l, bins=60, alpha=.55, color=C_METH[cle], label=cle.split("_")[0])
-ax[0, 1].set_xscale("log")
-ax[0, 1].set_xlabel("largeur de l'intervalle")
-ax[0, 1].set_title("2. Efficacite : distribution des largeurs")
-ax[0, 1].legend()
-
-# 3 - adaptativite : largeur vs prediction
-for cle, _ in METHODES:
-    m = conf["Valeur_predite"] > 0
-    ax[0, 2].scatter(conf.loc[m, "Valeur_predite"], conf.loc[m, f"largeur_{cle}"],
-                     s=5, alpha=.25, color=C_METH[cle], label=cle.split("_")[0])
-ax[0, 2].set_xscale("log"); ax[0, 2].set_yscale("log")
-ax[0, 2].set_xlabel("valeur predite"); ax[0, 2].set_ylabel("largeur")
-ax[0, 2].set_title("3. Adaptativite au contexte")
-ax[0, 2].legend(markerscale=3)
-
-# 4 - couverture conditionnelle par strate
-if not cc_strate.empty:
-    x = np.arange(len(cc_strate)); w = 0.26
-    for i, (cle, _) in enumerate(METHODES):
-        ax[1, 0].bar(x + i * w, cc_strate[f"couv_{cle}"], w,
-                     label=cle.split("_")[0], color=C_METH[cle])
-    ax[1, 0].axhline(1 - ALPHA, color="k", ls="--", lw=2)
-    ax[1, 0].set_xticks(x + w)
-    ax[1, 0].set_xticklabels(cc_strate["strate"])
-    ax[1, 0].set_ylabel("couverture")
-    ax[1, 0].set_title("4. Couverture conditionnelle par strate")
-    ax[1, 0].legend(fontsize=8)
-
-# 5 - intervalles sur un echantillon trie, signaux en rouge
-ech = conf.sample(min(250, len(conf)), random_state=RANDOM_STATE)
-ech = ech.sort_values("Valeur_predite").reset_index(drop=True)
-xs = np.arange(len(ech))
-ax[1, 1].fill_between(xs, ech[f"lo_{CLE_RETENUE}"], ech[f"hi_{CLE_RETENUE}"],
-                      alpha=.3, color="darkgreen", label="intervalle conforme")
-ax[1, 1].plot(xs, ech["Valeur_predite"], lw=1.4, color="black", label="predit")
-hors = (ech[f"couvert_{CLE_RETENUE}"] == 0).to_numpy()
-ax[1, 1].scatter(xs[~hors], ech.loc[~hors, "Valeur_reelle"], s=7,
-                 color="steelblue", label="reel couvert")
-ax[1, 1].scatter(xs[hors], ech.loc[hors, "Valeur_reelle"], s=30,
-                 color="red", marker="x", label="SIGNAL")
-ax[1, 1].set_yscale("symlog")
-ax[1, 1].set_title(f"5. Intervalles {CLE_RETENUE} (echantillon trie)")
-ax[1, 1].legend(fontsize=8)
-
-# 6 - severite des signaux
-sev = conf[conf["severite"] > 0]["severite"]
-if len(sev):
-    ax[1, 2].hist(sev, bins=40, color="darkorange")
-    ax[1, 2].set_yscale("log")
-    ax[1, 2].set_xlabel("severite (depassement / largeur)")
-    ax[1, 2].set_ylabel("nombre de signaux")
-    ax[1, 2].set_title(f"6. Severite des {len(sev):,} signaux")
+paquet = joblib.load(CHEMIN_ARTEFACT)
+print(f"Artefact du {paquet.get('date', '?')} | MAE test enregistree : "
+      f"{paquet.get('mae_test', float('nan')):,.0f}")
+
+# --- Reconstruction des predictions, a l'identique de votre cellule d'origine
+X_art = paquet["X_test"][paquet["features"]].copy()
+for c in paquet["categorielles"]:
+    X_art[c] = pd.Categorical(X_art[c].astype(str),
+                              categories=[str(v) for v in paquet["categories"][c]])
+
+df_final = paquet["infos_test"].reset_index(drop=True).copy()
+df_final["y_pred"]     = np.clip(paquet["modele"].predict(X_art), 0, None)
+df_final["y_obs_art"]  = np.asarray(paquet["y_test"], dtype=float)
+
+mae_recalc = (df_final["y_pred"] - df_final["y_obs_art"]).abs().mean()
+print(f"MAE recalculee : {mae_recalc:,.0f}  ({len(df_final):,} predictions)")
+
+# --- Meme referentiel temporel que df ---------------------------------------
+df_final = construire_time_idx(df_final, annee_ref=ANNEE_REF)
+
+cles_manquantes = [c for c in ID_COLS if c not in df_final.columns]
+if cles_manquantes:
+    raise KeyError(
+        f"L'artefact ne contient pas {cles_manquantes}. La jointure ne peut pas "
+        f"etre faite au bon niveau de granularite. Colonnes disponibles dans "
+        f"infos_test : {sorted(df_final.columns.tolist())}")
+
+CLE = ID_COLS + ["time_idx"]
+
+# --- Controle d'unicite AVANT jointure (evite l'explosion many-to-many) ------
+n_dup = df_final.duplicated(subset=CLE).sum()
+if n_dup:
+    print(f"ATTENTION : {n_dup:,} doublons sur la cle dans l'artefact, "
+          f"agregation par moyenne.")
+    externe = (df_final.groupby(CLE, as_index=False)
+                       .agg(y_pred=("y_pred", "mean"), y_obs_art=("y_obs_art", "mean")))
 else:
-    ax[1, 2].axis("off")
+    externe = df_final[CLE + ["y_pred", "y_obs_art"]]
 
-plt.tight_layout()
-plt.show()
+# Granularite de df elle-meme : si un couple (identifiants, periode) apparait
+# plusieurs fois, y_pred serait duplique a l'identique sur des lignes qui ne
+# designent pas le meme objet. Il manque alors une colonne a la cle.
+n_dup_df = df.duplicated(subset=CLE).sum()
+if n_dup_df:
+    print(f"/!\\ {n_dup_df:,} doublons sur {CLE} dans df : la cle metier est "
+          f"incomplete, y_pred sera duplique. Ajouter la dimension manquante.")
 
+df = df.merge(externe, on=CLE, how="left", validate="m:1")
 
-# --- Arbitrage couverture / largeur selon alpha ------------------------------
-#  Repond a la question "quel niveau de confiance retenir ?" en montrant le
-#  cout en largeur de chaque gain de couverture.
-print("\n" + "=" * 78)
-print("ARBITRAGE COUVERTURE / LARGEUR")
-print("=" * 78)
+# --- Rapport de jointure : ne jamais avancer sans le lire --------------------
+periodes_art = sorted(df_final["time_idx"].unique())
+print(f"\nPeriodes couvertes par l'artefact : {periodes_art}")
+print(f"Taux d'appariement global : {df['y_pred'].notna().mean():.1%} "
+      f"({df['y_pred'].notna().sum():,} / {len(df):,} lignes)")
+print("\nAppariement par periode :")
+print(df.groupby("time_idx")["y_pred"]
+        .agg(n="size", apparie=lambda s: s.notna().sum())
+        .assign(taux=lambda d: (d["apparie"] / d["n"]).map("{:.1%}".format))
+        .to_string())
 
-bal = []
-for a in ALPHAS_BALAYAGE:
-    iv, _, _ = construire_intervalles(a, verbose=False)
-    for cle, _ in METHODES:
-        lo_a, hi_a = iv[cle]
-        bal.append(dict(alpha=a, cible=1 - a, methode=cle,
-                        couverture=float(((y_test >= lo_a) & (y_test <= hi_a)).mean()),
-                        largeur_mediane=float(np.median(hi_a - lo_a))))
-bal = pd.DataFrame(bal)
-print(bal.pivot(index="cible", columns="methode",
-                values="couverture").round(4).to_string())
-
-fig, ax = plt.subplots(1, 2, figsize=(14, 5))
-fig.suptitle("Arbitrage couverture / largeur", fontsize=14, fontweight="bold")
-for cle, _ in METHODES:
-    s = bal[bal["methode"] == cle].sort_values("cible")
-    ax[0].plot(s["cible"], s["couverture"], "o-", lw=2,
-               color=C_METH[cle], label=cle.split("_")[0])
-    ax[1].plot(s["cible"], s["largeur_mediane"], "o-", lw=2,
-               color=C_METH[cle], label=cle.split("_")[0])
-ax[0].plot([0.78, 1.0], [0.78, 1.0], "k--", lw=1.5, label="calibration parfaite")
-ax[0].set_xlabel("couverture visee"); ax[0].set_ylabel("couverture obtenue")
-ax[0].set_title("Validite selon le niveau"); ax[0].legend()
-ax[1].set_xlabel("couverture visee"); ax[1].set_ylabel("largeur mediane")
-ax[1].set_yscale("log")
-ax[1].set_title("Cout en largeur"); ax[1].legend()
-plt.tight_layout(); plt.show()
+# --- Coherence des cibles sur les lignes appariees ---------------------------
+comm = df["y_pred"].notna() & df[TARGET].notna()
+if comm.any():
+    ecart = (df.loc[comm, TARGET].astype(float) - df.loc[comm, "y_obs_art"]).abs()
+    print(f"\nCoherence des cibles sur {comm.sum():,} lignes appariees : "
+          f"ecart max = {ecart.max():,.4f}")
+    if ecart.max() > 1e-6:
+        print("  /!\\ Les cibles divergent : l'artefact et df_model ne portent pas "
+              "sur la meme base. Verifier avant d'exploiter y_pred.")
+df = df.drop(columns=["y_obs_art"])
 
 
+# %% ==========================================================================
+#  CELLULE 3 - ANONYMISATION DES IDENTIFIANTS ET TYPAGE
+#
+#  Le dictionnaire de correspondance est CONSERVE : sans lui, impossible de
+#  redonner au metier le nom du sous-portefeuille signale comme atypique.
 # =============================================================================
-# BLOC 11 - SAUVEGARDE
-# =============================================================================
-resultats.to_csv("resultats_comparaison_modeles.csv")
-mae_strate.to_csv("resultats_mae_par_strate.csv")
-coefs_glm.to_csv("glm_coefficients.csv")
-conf.to_csv("predictions_conformal.csv", index=False)
-resume_conf.to_csv("conformal_validite_efficacite.csv", index=False)
-cc_strate.to_csv("conformal_couverture_strate.csv", index=False)
-bal.to_csv("conformal_arbitrage_alpha.csv", index=False)
-if len(signaux):
-    signaux.to_csv("conformal_signaux_prioritaires.csv", index=False)
-for col, cc in cc_metier.items():
-    cc.to_csv(f"conformal_couverture_{col}.csv", index=False)
-joblib.dump({"modeles": modeles, "prep": prep, "colonnes": list(COLONNES),
-             "colonnes_glm": list(cols_glm)}, "modeles_et_preprocessing.pkl")
+prefix_map = {"Partner": "PART", "Companies": "COMP", "Lob": "LOB",
+              "Activity": "ACT", "Periodicity": "PER", "Risk": "RISK"}
 
-print("\n" + "=" * 78)
-print("ARTEFACTS SAUVEGARDES")
-print("=" * 78)
-for f in ["resultats_comparaison_modeles.csv", "resultats_mae_par_strate.csv",
-          "glm_coefficients.csv", "predictions_conformal.csv",
-          "conformal_validite_efficacite.csv", "conformal_couverture_strate.csv",
-          "conformal_arbitrage_alpha.csv", "conformal_signaux_prioritaires.csv",
-          "modeles_et_preprocessing.pkl"]:
-    print(f"   {f}")
-print("=" * 78)
+mappings_anonymisation = {}
+for col in ID_COLS:
+    prefixe = prefix_map.get(col, col.upper()[:4])
+    valeurs = sorted(df[col].dropna().unique())
+    mapping = {v: f"{prefixe}_{i:02d}" for i, v in enumerate(valeurs, start=1)}
+    mappings_anonymisation[col] = mapping
+    df[col] = df[col].map(mapping)
+    print(f"{col:14s} -> {len(mapping):3d} modalites anonymisees")
+
+joblib.dump(mappings_anonymisation, "mapping_anonymisation.joblib")
+
+# --- Selection des features --------------------------------------------------
+# 'Time' est ecarte : il encode la periode. En "Q1".."Q4" il donne la
+# saisonnalite en clair ; en "2024Q3" chaque periode est une modalite jamais
+# vue au test, et LightGBM enverrait tout le test dans une branche arbitraire.
+EXCLUDE_COLS = ([TARGET, "time_idx", "year", "quarter", "annee", "Time", "y_pred"]
+                + LEAKS)
+
+FEATURE_COLS = [c for c in df.columns if c not in EXCLUDE_COLS]
+
+CATEGORIELLES = [c for c in FEATURE_COLS
+                 if df[c].dtype == object or str(df[c].dtype) == "category"]
+for c in CATEGORIELLES:
+    df[c] = df[c].astype("category")
+
+print(f"\n{len(FEATURE_COLS)} features, dont {len(CATEGORIELLES)} categorielles")
+print(f"Categorielles : {CATEGORIELLES}")
+absentes = [c for c in EXCLUDE_COLS if c not in df.columns]
+if absentes:
+    print(f"Note : colonnes listees en exclusion mais absentes de df : {absentes}")
+
+
+# %% ==========================================================================
+#  CELLULE 4 - DECOUPAGE TEMPOREL train / calibration / test
+#
+#  La calibration doit etre disjointe de l'entrainement ET anterieure au test.
+#  Calibrer sur des donnees vues a l'entrainement donne des scores de
+#  non-conformite trop petits, donc des intervalles trop etroits et une
+#  couverture reelle inferieure au niveau annonce.
+# =============================================================================
+def decoupage_chronologique(df_raw, time_col="time_idx",
+                            n_calib=N_CALIB, n_test=N_TEST):
+    periodes = sorted(df_raw[time_col].unique())
+    if len(periodes) <= n_calib + n_test:
+        raise ValueError(
+            f"{len(periodes)} periodes disponibles, il en faut au moins "
+            f"{n_calib + n_test + 1} pour reserver {n_calib} de calibration "
+            f"et {n_test} de test.")
+
+    p_test  = periodes[-n_test:]
+    p_calib = periodes[-(n_test + n_calib):-n_test]
+    p_train = periodes[:-(n_test + n_calib)]
+
+    blocs = {}
+    for nom, per in [("train", p_train), ("calib", p_calib), ("test", p_test)]:
+        bloc = df_raw[df_raw[time_col].isin(per)].copy().reset_index(drop=True)
+        y = bloc[TARGET].astype(float)
+        n_util = int(np.isfinite(y).sum())
+        print(f"{nom:6s} periodes {per[0]}-{per[-1]} | {len(bloc):7,} lignes | "
+              f"{n_util:7,} cibles exploitables ({y.isna().mean():5.1%} NaN)")
+        if n_util == 0:
+            raise RuntimeError(
+                f"Le bloc '{nom}' n'a AUCUNE cible exploitable. Les periodes "
+                f"{per} ne sont pas cloturees : les ajouter a EXCLURE_PERIODES "
+                f"ou augmenter N_CALIB / N_TEST pour reculer le decoupage.")
+        blocs[nom] = bloc
+    return blocs["train"], blocs["calib"], blocs["test"], \
+           {"train": p_train, "calib": p_calib, "test": p_test}
+
+
+df_train, df_calib, df_test, periodes_dict = decoupage_chronologique(df)
+
+
+# %% ==========================================================================
+#  CELLULE 5 - ENCODEURS (les deux voies, utilisees correctement)
+# =============================================================================
+def _noms_propres(noms):
+    """LightGBM refuse les caracteres JSON speciaux dans les noms de features.
+    Un libelle metier contenant [ ] < > fait echouer .fit() sans rapport
+    apparent avec le probleme. On nettoie et on deduplique."""
+    vus, sortie = {}, []
+    for n in (re.sub(r"[^\w]+", "_", str(x)).strip("_") for x in noms):
+        k = vus.get(n, 0)
+        vus[n] = k + 1
+        sortie.append(n if k == 0 else f"{n}__{k}")
+    return sortie
+
+
+class EncodeurNatif:
+    """LightGBM traite les categorielles nativement.
+
+    Sur des identifiants a forte cardinalite (Partner, Companies), le
+    regroupement par gradient de LightGBM est superieur au one-hot : il ne
+    cree pas des centaines de colonnes creuses et expose cat_smooth / cat_l2.
+    C'est aussi l'encodage du modele sauvegarde dans l'artefact, donc le seul
+    qui rende les deux modeles comparables.
+    """
+
+    def fit(self, X):
+        self.colonnes_ = list(X.columns)
+        self.cat_cols_ = [c for c in X.columns
+                          if str(X[c].dtype) in ("category", "object")]
+        # Les colonnes ont ete typees "category" sur le df COMPLET en cellule 3 :
+        # la liste des modalites est donc celle de tout le jeu, train inclus.
+        # Ce n'est pas une fuite, aucune information sur la cible n'intervient,
+        # seulement la liste des modalites existantes. C'est meme necessaire :
+        # sans elle, les codes categoriels de calib et test ne correspondraient
+        # plus a ceux du train et les predictions seraient fausses SANS erreur.
+        # Une modalite absente du train ne recoit simplement aucun split.
+        self.categories_ = {c: [str(v) for v in X[c].astype("category").cat.categories]
+                            for c in self.cat_cols_}
+        return self
+
+    def transform(self, X):
+        X = X[self.colonnes_].copy()
+        for c in self.cat_cols_:
+            X[c] = pd.Categorical(X[c].astype(str), categories=self.categories_[c])
+        return X
+
+    @property
+    def cat_features(self):
+        return self.cat_cols_ if self.cat_cols_ else "auto"
+
+
+class EncodeurPipeline:
+    """ColumnTransformer scikit-learn : impute + standardise + one-hot.
+
+    min_frequency regroupe les modalites rares dans une categorie
+    'infrequent'. Sans ce garde-fou, un identifiant a 400 modalites produit
+    400 colonnes creuses et les hyperparametres regles pour l'espace natif
+    (min_child_samples=139, colsample_bytree=0.74) deviennent absurdes.
+    """
+
+    def fit(self, X):
+        self.colonnes_ = list(X.columns)
+        num = X.select_dtypes(include=["number"]).columns.tolist()
+        cat = X.select_dtypes(include=["object", "category"]).columns.tolist()
+
+        try:
+            ohe = OneHotEncoder(handle_unknown="infrequent_if_exist",
+                                sparse_output=False,
+                                min_frequency=MIN_FREQ_MODALITE)
+        except TypeError:                      # scikit-learn < 1.2
+            ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+        self.ct_ = ColumnTransformer(
+            [("num", Pipeline([("imp", SimpleImputer(strategy="median")),
+                               ("sc",  StandardScaler())]), num),
+             ("cat", Pipeline([("imp", SimpleImputer(strategy="constant",
+                                                     fill_value="__manquant__")),
+                               ("oh",  ohe)]), cat)],
+            remainder="drop")
+        self.ct_.fit(X)
+        self.noms_ = _noms_propres(self.ct_.get_feature_names_out())
+        print(f"  one-hot : {len(self.colonnes_)} colonnes -> {len(self.noms_)} features")
+        return self
+
+    def transform(self, X):
+        M = self.ct_.transform(X[self.colonnes_])
+        return pd.DataFrame(M, columns=self.noms_, index=X.index)
+
+    @property
+    def cat_features(self):
+        return "auto"          # tout est numerique apres one-hot
+
+
+def construire_encodeur(mode):
+    if mode == "natif":
+        return EncodeurNatif()
+    if mode == "pipeline":
+        return EncodeurPipeline()
+    raise ValueError("MODE_ENCODAGE doit valoir 'natif' ou 'pipeline'.")
+
+
+# %% ==========================================================================
+#  CELLULE 6 - ENTRAINEMENT DES DEUX MODELES QUANTILES
+# =============================================================================
+def quantile_model_factory(alpha_level: float):
+    return lgb.LGBMRegressor(
+        objective="quantile", alpha=alpha_level,
+        learning_rate=0.03239, num_leaves=84, min_child_samples=139,
+        colsample_bytree=0.7365, subsample=0.982, subsample_freq=1,
+        reg_alpha=8.6629, reg_lambda=19.963, max_bin=451,
+        n_estimators=2000, max_depth=7,
+        random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+
+
+q_lo_level, q_hi_level = ALPHA / 2, 1 - ALPHA / 2
+
+X_train_brut = df_train[FEATURE_COLS]
+y_train      = df_train[TARGET].astype(float)
+
+valides = np.isfinite(y_train)
+X_train_brut, y_train = X_train_brut.loc[valides], y_train.loc[valides]
+print(f"Train : {len(y_train):,} lignes exploitables "
+      f"({(~valides).sum():,} ecartees pour cible manquante)")
+
+# L'encodeur est ajuste sur le TRAIN SEUL, jamais sur calib ni test.
+encodeur = construire_encodeur(MODE_ENCODAGE).fit(X_train_brut)
+X_train  = encodeur.transform(X_train_brut)
+
+modele_lo = quantile_model_factory(q_lo_level)
+modele_hi = quantile_model_factory(q_hi_level)
+modele_lo.fit(X_train, y_train, categorical_feature=encodeur.cat_features)
+modele_hi.fit(X_train, y_train, categorical_feature=encodeur.cat_features)
+
+print(f"Modeles quantiles {q_lo_level:.3f} et {q_hi_level:.3f} entraines "
+      f"(encodage {MODE_ENCODAGE}, {X_train.shape[1]} features).")
+
+
+# %% ==========================================================================
+#  CELLULE 7 - QUANTILE CONFORME SUR LA CALIBRATION
+#
+#  C'est l'etape qui transforme un intervalle quantile SANS garantie en un
+#  intervalle a couverture garantie a distance finie.
+# =============================================================================
+def quantile_conforme_cqr(y_calib, y_lo_calib, y_hi_calib, alpha: float):
+    """Score CQR de Romano, Patterson & Candes (2019) :
+        E_i = max( q_lo(X_i) - Y_i ,  Y_i - q_hi(X_i) )
+    negatif quand l'observation tombe dans l'intervalle nominal, positif sinon.
+
+    Le quantile est pris au rang ceil((n+1)(1-alpha))/n et NON au quantile
+    (1-alpha) classique : cette correction d'echantillon fini est ce qui rend
+    la garantie valide pour tout n. L'oublier donne une sous-couverture.
+    """
+    y  = np.asarray(y_calib,     dtype=float)
+    lo = np.asarray(y_lo_calib,  dtype=float)
+    hi = np.asarray(y_hi_calib,  dtype=float)
+    scores = np.maximum(lo - y, y - hi)
+
+    finis = np.isfinite(scores)
+    if (~finis).any():
+        print(f"  {(~finis).sum():,} / {len(scores):,} scores non finis ecartes "
+              f"(cible manquante en calibration).")
+    scores = scores[finis]
+    n = len(scores)
+
+    if n == 0:
+        raise ValueError(
+            "Calibration vide apres retrait des NaN : la cible est absente sur "
+            "toute la periode de calibration. Augmenter N_CALIB ou ajouter la "
+            "periode fautive a EXCLURE_PERIODES.")
+
+    niveau = np.ceil((n + 1) * (1 - alpha)) / n
+    if niveau > 1.0:
+        raise ValueError(
+            f"n={n} trop petit pour alpha={alpha} : il faut n >= "
+            f"{int(np.ceil(1 / alpha)) - 1}. Ecreter le niveau a 1 renverrait "
+            f"le score maximal en laissant croire a une garantie inexistante.")
+
+    if n < 100:
+        print(f"  n={n} : la garantie reste valide, mais la couverture realisee "
+              f"fluctuera d'environ {np.sqrt(alpha * (1 - alpha) / n):.1%}.")
+
+    return float(np.quantile(scores, niveau, method="higher")), scores
+
+
+X_calib = encodeur.transform(df_calib[FEATURE_COLS])
+y_calib = df_calib[TARGET].astype(float)
+
+y_lo_calib = modele_lo.predict(X_calib)
+y_hi_calib = modele_hi.predict(X_calib)
+
+n_croise = int((y_lo_calib > y_hi_calib).sum())
+if n_croise:
+    print(f"{n_croise:,} quantiles croises (lo > hi). Normal en regression "
+          f"quantile independante ; la conformalisation le corrige.")
+
+Q_hat, calib_scores = quantile_conforme_cqr(
+    y_calib.values, y_lo_calib, y_hi_calib, ALPHA)
+
+print(f"\nQ_hat (marge conforme) = {Q_hat:,.2f}   sur n = {len(calib_scores):,}")
+print(f"Part des scores negatifs (deja couverts sans marge) : "
+      f"{(calib_scores < 0).mean():.1%}")
+
+
+# %% ==========================================================================
+#  CELLULE 8 - APPLICATION AU TEST
+# =============================================================================
+X_test_brut = df_test[FEATURE_COLS]
+X_test      = encodeur.transform(X_test_brut)
+y_test      = df_test[TARGET].astype(float)
+
+y_lo_test = modele_lo.predict(X_test)
+y_hi_test = modele_hi.predict(X_test)
+
+colonnes_sortie = ID_COLS + ["year", "quarter", "time_idx"]
+if "y_pred" in df_test.columns:
+    colonnes_sortie.append("y_pred")          # prediction LightGBM importee
+
+results_test = df_test[colonnes_sortie].copy().reset_index(drop=True)
+results_test["y_obs"]       = y_test.values
+results_test["borne_basse"] = y_lo_test - Q_hat
+results_test["borne_haute"] = y_hi_test + Q_hat
+results_test["centre_cqr"]  = (results_test["borne_basse"] + results_test["borne_haute"]) / 2
+results_test["largeur"]     = results_test["borne_haute"] - results_test["borne_basse"]
+
+results_test["dans_intervalle"] = results_test["y_obs"].between(
+    results_test["borne_basse"], results_test["borne_haute"])
+
+# Depassement signe : > 0 hors intervalle, <= 0 dedans.
+results_test["depassement"] = np.maximum(
+    results_test["borne_basse"] - results_test["y_obs"],
+    results_test["y_obs"] - results_test["borne_haute"])
+
+# Severite normalisee par la largeur locale : c'est ce qui rend comparables
+# un sous-portefeuille a 0,7 EUR et un autre a 317 MEUR, sans logarithme.
+results_test["severite"] = results_test["depassement"] / results_test["largeur"].replace(0, np.nan)
+
+evaluables = results_test["y_obs"].notna()
+couverture = results_test.loc[evaluables, "dans_intervalle"].mean()
+largeur_moy = results_test["largeur"].mean()
+
+print(f"Couverture empirique : {couverture:.1%}   (visee {1 - ALPHA:.0%})")
+print(f"  sur {evaluables.sum():,} observations evaluables / {len(results_test):,}")
+print(f"Largeur mediane : {results_test['largeur'].median():,.0f}")
+print(f"Coefficient de variation de la largeur : "
+      f"{results_test['largeur'].std() / largeur_moy:.2f}")
+print("  (proche de 0 = intervalle constant, donc equivalent a un seuil fixe ;")
+print("   nettement > 0 = l'intervalle s'adapte au sous-portefeuille -> H2)")
+
+
+# %% ==========================================================================
+#  CELLULE 9 - COUVERTURE CONDITIONNELLE (hypothese H2)
+#
+#  La garantie conforme est MARGINALE : elle porte sur la moyenne, pas sur
+#  chaque strate. Barber et al. (2021) montrent qu'aucune garantie
+#  conditionnelle non triviale n'est atteignable sans hypothese
+#  supplementaire. Mesurer l'ecart par strate est donc le seul moyen honnete
+#  de savoir si l'intervalle tient sur les gros sous-portefeuilles.
+#
+#  Les strates sont definies sur la PREDICTION, jamais sur l'observe :
+#  decouper sur y_obs revient a conditionner sur le resultat teste.
+# =============================================================================
+utilise_y_pred = ("y_pred" in results_test.columns
+                  and results_test["y_pred"].notna().any())
+base_strate = results_test["y_pred"] if utilise_y_pred else results_test["centre_cqr"]
+nom_base = "y_pred (LightGBM importe)" if utilise_y_pred else "centre_cqr (repli)"
+
+# Sur une cible Tweedie a forte masse en zero, plusieurs percentiles peuvent
+# coincider. pd.cut refuse alors des bornes non strictement croissantes : on
+# deduplique et on renomme les strates en consequence plutot que de planter.
+seuils = base_strate.quantile([0.50, 0.90, 0.99]).values
+noms   = ["P50", "P90", "P99"]
+bornes, etiquettes, precedent = [-np.inf], [], "P0"
+for seuil, nom in zip(seuils, noms):
+    if seuil > bornes[-1]:
+        bornes.append(float(seuil))
+        etiquettes.append(f"{precedent}-{nom}")
+        precedent = nom
+bornes.append(np.inf)
+etiquettes.append(f"{precedent}+")
+
+if len(etiquettes) < 4:
+    print(f"NOTE : percentiles confondus sur {nom_base}, "
+          f"{len(etiquettes)} strates au lieu de 4 (masse importante en zero).")
+
+results_test["strate"] = pd.cut(base_strate, bins=bornes, labels=etiquettes)
+print(f"Strates construites sur {nom_base}\n")
+
+recap = (results_test[evaluables]
+         .groupby("strate", observed=True)
+         .agg(n=("y_obs", "size"),
+              couverture=("dans_intervalle", "mean"),
+              largeur_mediane=("largeur", "median"),
+              severite_max=("severite", "max")))
+recap["couverture"] = recap["couverture"].map("{:.1%}".format)
+print(recap.to_string())
+
+print("\nCouverture par dimension metier :")
+for dim in ID_COLS:
+    par_dim = (results_test[evaluables].groupby(dim, observed=True)["dans_intervalle"]
+               .agg(n="size", couv="mean"))
+    par_dim = par_dim[par_dim["n"] >= 30]
+    if len(par_dim):
+        print(f"  {dim:14s} min={par_dim['couv'].min():.1%}  "
+              f"max={par_dim['couv'].max():.1%}  sur {len(par_dim)} modalites (n>=30)")
+
+
+# %% ==========================================================================
+#  CELLULE 10 - PRIORISATION DES ANOMALIES (hypothese H3)
+# =============================================================================
+anomalies = (results_test[evaluables & (~results_test["dans_intervalle"])]
+             .sort_values("severite", ascending=False)
+             .reset_index(drop=True))
+
+print(f"{len(anomalies):,} observations hors intervalle "
+      f"({len(anomalies) / max(evaluables.sum(), 1):.1%} du test)\n")
+
+cols_aff = ID_COLS + ["year", "quarter", "y_obs", "borne_basse", "borne_haute", "severite"]
+if "y_pred" in anomalies.columns:
+    cols_aff.insert(-1, "y_pred")
+
+print("Top 20 des sous-portefeuilles a investiguer :")
+print(anomalies.head(20)[cols_aff].to_string(
+    index=False, float_format=lambda v: f"{v:,.2f}"))
+
+print("\nConcentration des signaux par axe metier :")
+for dim in ID_COLS:
+    top = anomalies[dim].value_counts().head(3)
+    if len(top):
+        print(f"  {dim:14s} " + " | ".join(f"{k}={v}" for k, v in top.items()))
+
+
+# %% ==========================================================================
+#  CELLULE 11 - SAUVEGARDE
+# =============================================================================
+results_test.to_csv("cqr_resultats_test.csv", index=False)
+anomalies.to_csv("cqr_anomalies_priorisees.csv", index=False)
+pd.DataFrame({"score": calib_scores}).to_csv("cqr_scores_calibration.csv", index=False)
+
+joblib.dump({
+    "encodeur": encodeur, "mode_encodage": MODE_ENCODAGE,
+    "modele_lo": modele_lo, "modele_hi": modele_hi,
+    "Q_hat": Q_hat, "alpha": ALPHA,
+    "features": FEATURE_COLS, "id_cols": ID_COLS,
+    "periodes": periodes_dict, "annee_ref": ANNEE_REF,
+    "n_calib": len(calib_scores), "couverture_test": float(couverture),
+}, "artefacts_modele/cqr_final.joblib")
+
+print("Sauvegarde :")
+print("  cqr_resultats_test.csv          - toutes les observations du test")
+print("  cqr_anomalies_priorisees.csv    - les hors-intervalle, tries par severite")
+print("  cqr_scores_calibration.csv      - scores de non-conformite")
+print("  artefacts_modele/cqr_final.joblib")
+print("  mapping_anonymisation.joblib    - pour redonner les vrais libelles")
