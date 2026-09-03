@@ -1,3 +1,110 @@
+
+import numpy as np, pandas as pd
+
+class EncodeurTabulaire:
+    """Remplacement direct de skrub.TableVectorizer, meme API
+    (fit / transform / fit_transform / get_feature_names_out).
+
+    Les categorielles deviennent des 'category' pandas avec modalites FIGEES
+    a l'ajustement. LightGBM les traite nativement : pas de colonnes creuses,
+    et une modalite inconnue au test devient simplement une valeur manquante.
+    """
+
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.colonnes_ = list(X.columns)
+        self.cat_cols_ = [c for c in X.columns
+                          if X[c].dtype == object
+                          or str(X[c].dtype) in ("category", "string")]
+        self.categories_ = {}
+        for c in self.cat_cols_:
+            v = X[c].astype("string")
+            self.categories_[c] = pd.Index(sorted(v.dropna().unique()))
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(X)[self.colonnes_].copy()
+        for c in self.colonnes_:
+            if c in self.cat_cols_:
+                X[c] = pd.Categorical(X[c].astype("string"),
+                                      categories=self.categories_[c])
+            else:
+                X[c] = pd.to_numeric(X[c], errors="coerce")
+        return X
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.colonnes_, dtype=object)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def compute_conformal_quantile(y_calib, y_lo_calib, y_hi_calib, alpha: float):
+    y  = np.asarray(y_calib,    dtype=float)
+    lo = np.asarray(y_lo_calib, dtype=float)
+    hi = np.asarray(y_hi_calib, dtype=float)
+    scores = np.maximum(lo - y, y - hi)
+
+    # LA LIGNE QUI MANQUAIT
+    finis = np.isfinite(scores)
+    if (~finis).any():
+        print(f"  {(~finis).sum():,} / {len(scores):,} scores non finis ecartes "
+              f"(cible manquante en calibration).")
+    scores = scores[finis]
+
+    n = len(scores)
+    if n == 0:
+        raise ValueError("Calibration vide apres retrait des NaN : la cible est "
+                         "absente sur TOUTE la periode de calibration. "
+                         "Augmenter N_CALIB ou reculer le decoupage.")
+    if n < 30:
+        print(f"ATTENTION : seulement {n} observations en calibration.")
+
+    q_level = min(np.ceil((n + 1) * (1 - alpha)) / n, 1.0)
+    Q_hat = np.quantile(scores, q_level, method="higher")
+    return Q_hat, scores
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+print("calib :", len(df_calib), "lignes |", df_calib[TARGET].isna().sum(), "cibles NaN",
+      f"({df_calib[TARGET].isna().mean():.1%})")
+print("periodes calib :", sorted(df_calib["time_idx"].unique()))
+print("y_lo NaN :", np.isnan(pipeline_lo.predict(df_calib[FEATURE_COLS])).sum())
+
+
+
+
+
+
+
+
 # -*- coding: utf-8 -*-
 # =============================================================================
 #  CQR (Conformalized Quantile Regression) - NOTEBOOK ORDONNE DE BOUT EN BOUT
