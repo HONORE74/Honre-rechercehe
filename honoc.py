@@ -1,7 +1,563 @@
 
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  SELECTION DE LA CIBLE ET GESTION DES MODELES ENREGISTRES
+#
+#  Trois problemes traites, dans l'ordre :
+#
+#    1. Ne plus retaper le nom de l'indicateur. Un ruban de selection en haut
+#       du notebook pose TARGET, NOM_ETUDE et CHEMIN_MODELE d'un seul clic.
+#    2. Ne plus ecraser le meme fichier. Chaque indicateur a son propre
+#       artefact, nomme d'apres lui, plus un registre de ce qui existe.
+#    3. Ne plus refaire le protocole dans le second notebook. Une ligne
+#       recharge le modele voulu, avec ses donnees de test et ses metriques.
+#
+#  USAGE
+#  -----
+#  RIEN A AJOUTER : collez tout ce fichier dans la toute premiere cellule de
+#  votre notebook d'entrainement et executez-la. Le ruban s'affiche tout seul
+#  (derniere ligne du fichier), avant meme que vous n'ecriviez quoi que ce
+#  soit. Cliquez sur l'indicateur voulu, puis ecrivez la suite de votre code
+#  en dessous, dans les cellules suivantes.
+#
+#  A l'enregistrement du modele, dans une cellule plus bas :
+#      chemin = sauver_modele(modele_apres, X_tr, params_finaux,
+#                             metriques_test=metriques("Test", y_te, pred_te),
+#                             X_test=X_te, y_test=y_te, infos_test=infos_te)
+#
+#  Second notebook : collez le fichier dans sa premiere cellule EGALEMENT,
+#  puis dans la cellule suivante :
+#      paquet   = charger_modele("RBNS_eop")     # ou selecteur_modele()
+#      df_final = paquet.tableau()               # y_obs / y_pred prets
+#
+#  POURQUOI UN DICTIONNAIRE ET NON VOTRE CLASSE ModeleRBNS
+#  --------------------------------------------------------
+#  Une instance de classe enregistree par joblib ne se recharge QUE si la
+#  classe est definie dans la session qui la relit. Dans un second notebook ou
+#  ModeleRBNS n'existe pas, joblib.load leve
+#      AttributeError: Can't get attribute 'ModeleRBNS' on module __main__
+#  et il n'y a aucun moyen de recuperer le contenu sans recopier la classe.
+#  L'artefact est donc un dictionnaire, qui se relit partout avec joblib seul.
+#  Le confort de la classe est rendu au chargement, par un objet construit a
+#  la volee, pas par un objet deserialise.
+# =============================================================================
 
-from cibles_et_modeles import *
-ruban = selecteur_cible()
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display, HTML
+    _WIDGETS = True
+except ImportError:                                    # utilisable hors notebook
+    _WIDGETS = False
+
+# ┌──────────────────────────── A PARAMETRER ──────────────────────────┐
+DOSSIER_ARTEFACTS = Path("artefacts_modele")
+
+#  Les indicateurs proposes dans le ruban. Cle = nom exact de la colonne,
+#  valeur = libelle lisible affiche sur le bouton.
+INDICATEURS = {
+    "RBNS_eop":               "RBNS",
+    "IBNR_best_estimate_eop": "IBNR best estimate",
+    "Risk_margin_eop":        "Marge de risque",
+    "BEL_eop":                "Best estimate liabilities",
+    "CSM_eop":                "CSM",
+    "LRC_eop":                "LRC",
+    "LIC_eop":                "LIC",
+    "technical_losses":       "Pertes techniques",
+    "PLR":                    "PLR",
+    "GWP":                    "Primes emises",
+}
+CIBLE_PAR_DEFAUT = "RBNS_eop"
+# └─────────────────────────────────────────────────────────────────────┘
+
+FICHIER_REGISTRE = "registre_modeles.json"
+_ENCRE, _OK, _ACCENT, _BLEU = "#141B34", "#2e7d32", "#c62828", "#0d47a1"
+
+
+# =============================================================================
+#  1. CIBLE ACTIVE
+# =============================================================================
+def _slug(nom):
+    """Nom de fichier sur, derive du nom de la colonne."""
+    return re.sub(r"[^0-9A-Za-z_.-]+", "_", str(nom)).strip("_") or "cible"
+
+
+def chemin_modele(cible, dossier=None):
+    dossier = Path(dossier or DOSSIER_ARTEFACTS)
+    return dossier / f"{_slug(cible)}_modele.joblib"
+
+
+def _injecter(**kv):
+    """Publie les variables dans le notebook, pas seulement dans ce module.
+
+    Sans cela, un `from cibles_et_modeles import *` poserait TARGET dans le
+    module et non dans la session, et vos cellules suivantes liraient l'ancienne
+    valeur sans qu'aucune erreur ne le signale.
+    """
+    ns = None
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        ns = ip.user_ns if ip is not None else None
+    except Exception:
+        pass
+    for k, v in kv.items():
+        globals()[k] = v
+        if ns is not None:
+            ns[k] = v
+
+
+def definir_cible(cible, dossier=None, silencieux=False):
+    """Pose TARGET, CIBLE, NOM_ETUDE et CHEMIN_MODELE partout.
+
+    Equivalent programmatique du ruban. A utiliser dans un run automatise, ou
+    l'etat d'un widget ne serait pas reproductible.
+    """
+    ch = chemin_modele(cible, dossier)
+    _injecter(TARGET=cible, CIBLE=cible, NOM_ETUDE=_slug(cible),
+              CHEMIN_MODELE=ch, CIBLE_ACTIVE=cible)
+    if not silencieux:
+        etat = "deja enregistre" if ch.exists() else "pas encore enregistre"
+        print(f"TARGET = {cible!r}   |   fichier : {ch}   ({etat})")
+    return cible
+
+
+def _libelles(indicateurs, df=None):
+    """(libelle, colonne) pour le ruban, en signalant les colonnes absentes."""
+    items = (indicateurs.items() if isinstance(indicateurs, dict)
+             else [(c, c) for c in indicateurs])
+    options = []
+    for col, lib in items:
+        if df is not None and col not in df.columns:
+            options.append((f"{lib}  (absent)", col))
+        else:
+            options.append((lib, col))
+    return options
+
+
+def selecteur_cible(indicateurs=None, df=None, defaut=None, dossier=None):
+    """Ruban de selection de l'indicateur. Un clic pose TARGET.
+
+    Retourne le widget. La cible par defaut est posee immediatement, pour
+    qu'un `Run All` sans clic parte quand meme d'un etat defini.
+    """
+    indicateurs = indicateurs or INDICATEURS
+    if df is None:
+        df = globals().get("df")
+    options = _libelles(indicateurs, df)
+    valeurs = [v for _, v in options]
+    defaut = defaut or (CIBLE_PAR_DEFAUT if CIBLE_PAR_DEFAUT in valeurs
+                        else valeurs[0])
+
+    definir_cible(defaut, dossier, silencieux=True)
+
+    if not _WIDGETS:
+        print("ipywidgets absent : cible posee par defaut.")
+        definir_cible(defaut, dossier)
+        return None
+
+    ruban = widgets.ToggleButtons(
+        options=options, value=defaut, description="",
+        layout=widgets.Layout(display="flex", flex_flow="row wrap",
+                              width="100%"),
+        style={"button_width": "auto"})
+    bandeau = widgets.HTML()
+
+    def _rendu(cible):
+        ch = chemin_modele(cible, dossier)
+        if ch.exists():
+            taille = ch.stat().st_size / 1e6
+            etat = (f"<b style='color:{_OK}'>modele enregistre</b> "
+                    f"({taille:.1f} Mo)")
+        else:
+            etat = f"<span style='color:{_ACCENT}'>pas encore entraine</span>"
+        absente = (df is not None and cible not in df.columns)
+        alerte = (f"<br><b style='color:{_ACCENT}'>Attention : la colonne "
+                  f"{cible} est absente de df.</b>" if absente else "")
+        bandeau.value = (
+            f"<div style='font-family:system-ui,sans-serif;font-size:13px;"
+            f"background:#eef3fb;color:{_BLEU};padding:10px 14px;"
+            f"border-radius:6px;margin:8px 0'>"
+            f"Cible active : <b style='font-size:15px'>{cible}</b>"
+            f" &nbsp;·&nbsp; fichier <code>{ch}</code> &nbsp;·&nbsp; {etat}"
+            f"{alerte}</div>")
+
+    def _au_clic(c):
+        if c["name"] == "value":
+            definir_cible(c["new"], dossier, silencieux=True)
+            _rendu(c["new"])
+
+    ruban.observe(_au_clic, names="value")
+    _rendu(defaut)
+    display(widgets.VBox([ruban, bandeau]))
+    return ruban
+
+
+# =============================================================================
+#  2. ENREGISTREMENT
+# =============================================================================
+def _categories(X):
+    return {c: list(X[c].cat.categories) for c in X.columns
+            if str(X[c].dtype) == "category"}
+
+
+def preparer(X, paquet):
+    """Remet les colonnes du modele dans l'ordre et le dtype attendus."""
+    feats = paquet["features"]
+    manquantes = [c for c in feats if c not in X.columns]
+    if manquantes:
+        raise KeyError(f"Colonnes absentes de X : {manquantes[:5]}"
+                       f"{' ...' if len(manquantes) > 5 else ''}")
+    Xp = X[feats].copy()
+    for c in paquet.get("categorielles", []):
+        Xp[c] = pd.Categorical(Xp[c].astype(str),
+                               categories=paquet["categories"][c])
+    return Xp
+
+
+def predire(paquet, X, positif=True):
+    p = paquet["modele"].predict(preparer(X, paquet))
+    return np.clip(p, 0, None) if positif else p
+
+
+def sauver_modele(modele, X_tr, params=None, *, cible=None, metriques_test=None,
+                  X_test=None, y_test=None, infos_test=None, dossier=None,
+                  verifier=True, extras=None):
+    """Enregistre le modele dans un fichier propre a la cible active.
+
+    Ce qui est ecrit est un dictionnaire, relisable partout avec joblib seul.
+    X_test / y_test / infos_test sont facultatifs mais fortement conseilles :
+    ce sont eux qui permettent au second notebook de ne rien recalculer.
+    """
+    cible = cible or globals().get("CIBLE_ACTIVE") or globals().get("TARGET")
+    if not cible:
+        raise ValueError("Aucune cible active. Appelez selecteur_cible() ou "
+                         "definir_cible('NOM_COLONNE') d'abord.")
+    dossier = Path(dossier or DOSSIER_ARTEFACTS)
+    dossier.mkdir(parents=True, exist_ok=True)
+    chemin = chemin_modele(cible, dossier)
+
+    cats = _categories(X_tr)
+    paquet = {
+        "cible": cible,
+        "modele": modele,
+        "features": list(X_tr.columns),
+        "categorielles": list(cats.keys()),
+        "categories": cats,
+        "params": params,
+        "metriques_test": metriques_test,
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "n_train": int(len(X_tr)),
+        "X_test": X_test,
+        "y_test": None if y_test is None else np.asarray(y_test),
+        "infos_test": infos_test,
+        "format": "dict-v1",
+    }
+    if extras:
+        paquet.update(extras)
+
+    joblib.dump(paquet, chemin)
+    taille = chemin.stat().st_size / 1e6
+
+    #  Verification de rechargement. Un modele qui ne redonne pas exactement
+    #  les memes predictions apres un aller-retour disque est inutilisable, et
+    #  le probleme ne se verrait qu'au moment ou l'on s'en sert.
+    ecart, statut = None, "non verifie"
+    if verifier and X_test is not None:
+        relu = joblib.load(chemin)
+        ecart = float(np.abs(predire(relu, X_test)
+                             - predire(paquet, X_test)).max())
+        statut = "identique" if ecart < 1e-9 else "ECART, A VERIFIER"
+
+    _maj_registre(dossier, cible, paquet, chemin, taille)
+
+    mae = None
+    if isinstance(metriques_test, dict):
+        mae = metriques_test.get("MAE")
+    print(f"Cible      : {cible}")
+    print(f"Fichier    : {chemin.resolve()}  ({taille:.2f} Mo)")
+    print(f"Variables  : {len(paquet['features'])}"
+          + (f"   |   MAE test : {mae:,.0f}".replace(",", " ")
+             if isinstance(mae, (int, float)) else ""))
+    if ecart is not None:
+        print(f"Rechargement : ecart max {ecart:.3g}   ->   {statut}")
+    return chemin
+
+
+def _maj_registre(dossier, cible, paquet, chemin, taille):
+    """Un index lisible de ce qui existe, pour ne pas avoir a lister le disque."""
+    fichier = Path(dossier) / FICHIER_REGISTRE
+    reg = {}
+    if fichier.exists():
+        try:
+            reg = json.loads(fichier.read_text(encoding="utf-8"))
+        except Exception:
+            reg = {}
+    mae = (paquet["metriques_test"] or {}).get("MAE") \
+        if isinstance(paquet["metriques_test"], dict) else None
+    reg[cible] = {"fichier": chemin.name, "date": paquet["date"],
+                  "n_features": len(paquet["features"]),
+                  "n_train": paquet["n_train"],
+                  "mae_test": float(mae) if isinstance(mae, (int, float)) else None,
+                  "taille_mo": round(taille, 2)}
+    fichier.write_text(json.dumps(reg, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+
+
+# =============================================================================
+#  3. CHARGEMENT (second notebook)
+# =============================================================================
+_ALIAS = {"y_test": ("y_test", "y_te"), "X_test": ("X_test", "X_te"),
+          "infos_test": ("infos_test", "infos_te"), "cible": ("cible", "target")}
+
+
+def _normaliser(brut):
+    """Accepte le format dict de ce fichier ET vos artefacts precedents."""
+    if isinstance(brut, dict):
+        p = dict(brut)
+    else:                                   # ancienne instance de classe
+        p = {k: v for k, v in vars(brut).items() if not k.startswith("_")}
+    for cle, sources in _ALIAS.items():
+        if cle not in p:
+            for s in sources:
+                if s in p:
+                    p[cle] = p[s]
+                    break
+    if "mae_test" in p and not isinstance(p.get("metriques_test"), dict):
+        p["metriques_test"] = {"MAE": p["mae_test"]}
+    p.setdefault("cible", "cible inconnue")
+    p.setdefault("categorielles", [])
+    p.setdefault("categories", {})
+    for oblig in ("modele", "features"):
+        if oblig not in p:
+            raise KeyError(f"Artefact incomplet : cle '{oblig}' absente.")
+    return p
+
+
+class Modele:
+    """Confort de la classe, construit au chargement et non deserialise."""
+
+    def __init__(self, paquet, chemin=None):
+        self.p, self.chemin = paquet, chemin
+        for k in ("cible", "features", "categorielles", "categories",
+                  "params", "metriques_test", "date"):
+            setattr(self, k, paquet.get(k))
+        self.modele = paquet["modele"]
+
+    def __repr__(self):
+        mae = (self.metriques_test or {}).get("MAE") \
+            if isinstance(self.metriques_test, dict) else None
+        m = f" | MAE test {mae:,.0f}".replace(",", " ") \
+            if isinstance(mae, (int, float)) else ""
+        return (f"<Modele {self.cible} | {len(self.features)} variables{m} "
+                f"| {self.date}>")
+
+    def predire(self, X=None, positif=True):
+        X = self.p["X_test"] if X is None else X
+        if X is None:
+            raise ValueError("Aucun X fourni et aucun X_test dans l'artefact.")
+        return predire(self.p, X, positif)
+
+    def importance(self, n=20):
+        b = getattr(self.modele, "booster_", None)
+        noms = getattr(self.modele, "feature_name_", self.features)
+        if b is None:
+            raise AttributeError("Le modele n'expose pas d'importance de gain.")
+        v = pd.Series(b.feature_importance("gain"), index=noms)
+        return (100 * v / v.sum()).sort_values(ascending=False).head(n)
+
+    def tableau(self, trier=True):
+        """df_final pret a l'emploi : infos metier + y_obs + y_pred + ecart."""
+        X, y = self.p.get("X_test"), self.p.get("y_test")
+        if X is None or y is None:
+            raise ValueError("L'artefact ne contient pas X_test / y_test. "
+                             "Relancez sauver_modele() en les passant.")
+        infos = self.p.get("infos_test")
+        d = (infos.reset_index(drop=True).copy() if infos is not None
+             else pd.DataFrame(index=range(len(X))))
+        d[self.cible] = np.asarray(y)
+        d["y_obs"] = np.asarray(y)
+        d["y_pred"] = self.predire(X)
+        d["ecart"] = d["y_pred"] - d["y_obs"]
+        if trier:
+            d = d.sort_values("y_obs", ascending=False)
+        return d.reset_index(drop=True)
+
+    def resume(self, n=20):
+        d = self.tableau()
+        mae = d["ecart"].abs().mean()
+        enreg = (self.metriques_test or {}).get("MAE") \
+            if isinstance(self.metriques_test, dict) else None
+        print(f"Cible {self.cible}  |  modele du {self.date}  |  "
+              f"{len(d):,} predictions".replace(",", " "))
+        ligne = f"MAE recalculee : {mae:,.0f}".replace(",", " ")
+        if isinstance(enreg, (int, float)):
+            coherent = abs(mae - enreg) < max(1e-6 * max(enreg, 1), 1e-6)
+            ligne += (f"   (enregistree : {enreg:,.0f})".replace(",", " ")
+                      + ("   coherent" if coherent else "   ECART A VERIFIER"))
+        print(ligne)
+        print(d.head(n).to_string(
+            index=False, float_format=lambda v: f"{v:,.2f}".replace(",", " ")))
+        return d
+
+
+def lister_modeles(dossier=None):
+    """Ce qui est disponible sur le disque, sans rien charger en memoire."""
+    dossier = Path(dossier or DOSSIER_ARTEFACTS)
+    if not dossier.exists():
+        return pd.DataFrame(columns=["cible", "date", "n_features", "mae_test",
+                                     "taille_mo", "fichier"])
+    reg = {}
+    f = dossier / FICHIER_REGISTRE
+    if f.exists():
+        try:
+            reg = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            reg = {}
+    lignes = []
+    for cible, info in reg.items():
+        if (dossier / info["fichier"]).exists():
+            lignes.append({"cible": cible, **info})
+    connus = {l["fichier"] for l in lignes}
+    for ch in sorted(dossier.glob("*_modele.joblib")):     # artefacts hors registre
+        if ch.name not in connus:
+            lignes.append({"cible": ch.stem.replace("_modele", ""),
+                           "fichier": ch.name, "date": None, "n_features": None,
+                           "n_train": None, "mae_test": None,
+                           "taille_mo": round(ch.stat().st_size / 1e6, 2)})
+    return pd.DataFrame(lignes).sort_values("cible").reset_index(drop=True)
+
+
+def charger_modele(cible=None, dossier=None, chemin=None):
+    """Recharge un modele. Sans argument, prend la cible active du ruban."""
+    if chemin is not None:
+        ch = Path(chemin)
+    else:
+        cible = cible or globals().get("CIBLE_ACTIVE") or globals().get("TARGET")
+        dossier = Path(dossier or DOSSIER_ARTEFACTS)
+        if cible is None:
+            dispo = lister_modeles(dossier)
+            if len(dispo) == 1:
+                cible = dispo["cible"].iloc[0]
+            else:
+                raise ValueError(
+                    "Precisez la cible. Disponibles : "
+                    + ", ".join(dispo["cible"]) if len(dispo)
+                    else f"Aucun modele dans {dossier}.")
+        ch = chemin_modele(cible, dossier)
+    if not ch.exists():
+        dispo = lister_modeles(ch.parent)
+        raise FileNotFoundError(
+            f"{ch} introuvable. Disponibles : "
+            + (", ".join(dispo["cible"]) if len(dispo) else "aucun."))
+    return Modele(_normaliser(joblib.load(ch)), ch)
+
+
+def selecteur_modele(dossier=None, au_chargement=None):
+    """Ruban des modeles disponibles, dans le second notebook.
+
+    Retourne un dict dont la cle 'modele' contient le dernier charge, pour que
+    la cellule suivante puisse s'en servir sans reappeler charger_modele().
+    """
+    dossier = Path(dossier or DOSSIER_ARTEFACTS)
+    dispo = lister_modeles(dossier)
+    etat = {"modele": None}
+    if not len(dispo):
+        print(f"Aucun modele enregistre dans {dossier.resolve()}.")
+        return etat
+    if not _WIDGETS:
+        etat["modele"] = charger_modele(dispo["cible"].iloc[0], dossier)
+        print(etat["modele"])
+        return etat
+
+    options = []
+    for _, r in dispo.iterrows():
+        mae = (f"  MAE {r['mae_test']:,.0f}".replace(",", " ")
+               if pd.notna(r.get("mae_test")) else "")
+        options.append((f"{r['cible']}{mae}", r["cible"]))
+    ruban = widgets.ToggleButtons(
+        options=options, value=options[0][1],
+        layout=widgets.Layout(display="flex", flex_flow="row wrap", width="100%"),
+        style={"button_width": "auto"})
+    sortie = widgets.Output()
+
+    def _charger(cible):
+        with sortie:
+            from IPython.display import clear_output
+            clear_output(wait=True)
+            try:
+                m = charger_modele(cible, dossier)
+                etat["modele"] = m
+                _injecter(MODELE=m, CIBLE_CHARGEE=cible)
+                print(m)
+                if au_chargement is not None:
+                    au_chargement(m)
+            except Exception as e:
+                print(f"Chargement impossible : {type(e).__name__} : {e}")
+
+    ruban.observe(lambda c: _charger(c["new"]) if c["name"] == "value" else None,
+                  names="value")
+    display(widgets.VBox([ruban, sortie]))
+    _charger(options[0][1])
+    return etat
+
+
+# =============================================================================
+#  EXECUTION AUTOMATIQUE
+# =============================================================================
+#  Rien a ajouter apres avoir colle ce fichier : cette ligne s'execute des que
+#  la cellule tourne et affiche le ruban toute seule. C'est le fichier lui-meme
+#  qui se lance, pas une fonction que vous devez encore appeler.
+#
+#  Pour le SECOND notebook (chargement), collez ce fichier dans sa premiere
+#  cellule EXACTEMENT pareil, puis dans la cellule suivante appelez
+#  charger_modele("NOM_CIBLE") ou selecteur_modele() vous-meme -- le ruban
+#  ci-dessous, cote entrainement, ne suffit pas a savoir quel modele recharger.
+if _WIDGETS:
+    ruban = selecteur_cible()
+else:
+    print("ipywidgets absent (pip install ipywidgets) : "
+          f"cible posee par defaut sur {CIBLE_PAR_DEFAUT!r}.")
+    definir_cible(CIBLE_PAR_DEFAUT)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # -*- coding: utf-8 -*-
