@@ -1,6 +1,7 @@
 
 
-
+from cibles_et_modeles import *
+ruban = selecteur_cible()
 
 
 # -*- coding: utf-8 -*-
