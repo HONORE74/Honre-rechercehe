@@ -18,9 +18,22 @@
 #    5. Tableau de priorisation- votre tableau_priorisation(), en bas, filtre
 #                                 sur le perimetre courant
 #
-#  USAGE, en une cellule apres la votre :
-#      controles = dashboard_complet(anomalies_prio, expl)
-#      extras    = brancher_extensions(controles, anomalies_prio, expl, df)
+#  USAGE
+#  -----
+#  ORDRE OBLIGATOIRE, sur deux cellules distinctes :
+#
+#    Cellule 1 (la votre, deja ecrite) :
+#        controles = dashboard_complet(anomalies_prio, expl)
+#
+#    Cellule 2 (ce fichier, colle tel quel) :
+#        s'auto-branche TOUT SEUL en derniere ligne, A CONDITION que
+#        `controles`, `anomalies_prio`, `expl` et `df` existent DEJA dans la
+#        session au moment ou vous executez CETTE cellule. Sinon, un message
+#        clair vous dit ce qui manque -- rien ne reste silencieux.
+#
+#  Si vous collez ce fichier AVANT d'avoir execute votre `dashboard_complet()`,
+#  ou dans la MEME cellule que lui, `controles` n'existe pas encore : c'est la
+#  cause la plus frequente d'un dashboard qui ne s'affiche pas.
 #
 #  Prerequis : votre dashboard_complet() et tableau_priorisation() deja definis,
 #  ainsi que ID_COLS, TARGET, ALPHA. `shap` est optionnel : sans lui, les deux
@@ -645,3 +658,51 @@ def brancher_extensions(controles, anomalies_prio, expl, df,
             "variables": fw_vars, "tableau": z_table, "socle": socle,
             "moteur_shap": moteur_shap, "rafraichir": _maj_perimetre,
             "debrancher": lambda: _debrancher(sel_maille, sel_valeur)}
+
+
+# =============================================================================
+#  EXECUTION AUTOMATIQUE
+# =============================================================================
+#  Contrairement a un simple ruban de selection, ce fichier ne peut pas se
+#  brancher a l'aveugle : il lui faut `controles`, `anomalies_prio`, `expl` et
+#  `df`, qui viennent de VOTRE cellule dashboard_complet(), executee AVANT
+#  celle-ci. On regarde donc si ces variables existent deja dans la session.
+#  Si oui, le branchement se fait tout seul. Si non, un message precis dit ce
+#  qui manque, au lieu de laisser un ecran vide sans explication -- c'est
+#  exactement le symptome "rien ne s'affiche" qui se reglait en silence.
+def _variable_session(nom):
+    """Cherche `nom` dans la session Jupyter, pas seulement dans ce module."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is not None and nom in ip.user_ns:
+            return True, ip.user_ns[nom]
+    except Exception:
+        pass
+    if nom in globals():
+        return True, globals()[nom]
+    import __main__
+    if hasattr(__main__, nom):
+        return True, getattr(__main__, nom)
+    return False, None
+
+
+_PREREQUIS = ["controles", "anomalies_prio", "expl", "df"]
+_trouvees = {n: _variable_session(n) for n in _PREREQUIS}
+_manquantes = [n for n, (ok, _) in _trouvees.items() if not ok]
+
+if _manquantes:
+    print("=" * 74)
+    print("DASHBOARD NON AFFICHE : variables manquantes dans la session")
+    print("=" * 74)
+    for n in _manquantes:
+        print(f"  - {n}")
+    print()
+    print("Executez D'ABORD, dans une cellule PRECEDENTE, votre code qui cree")
+    print("ces variables -- typiquement :")
+    print("    controles = dashboard_complet(anomalies_prio, expl)")
+    print("Puis relancez CETTE cellule (celle de l'extension) une seconde fois.")
+else:
+    extras = brancher_extensions(
+        _trouvees["controles"][1], _trouvees["anomalies_prio"][1],
+        _trouvees["expl"][1], _trouvees["df"][1])
