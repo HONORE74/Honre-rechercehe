@@ -1,69 +1,65 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  TABLEAU DE BORD UNIFIE - anomalies, evolution, SHAP, priorisation
+#  TABLEAU DE BORD UNIFIE - anomalies, evolution, priorisation
 #
 #  UN SEUL BLOC, AUTONOME. Rien a executer avant, hormis d'avoir en session :
 #      anomalies_prio, expl, df, ID_COLS, TARGET      (ALPHA facultatif)
-#  Aucune dependance a dashboard_complet(), tableau_priorisation() ou aux
-#  helpers _creer_fw_* de vos cellules precedentes : tout est redefini ici.
 #
-#  CE QUE VOUS AVIEZ DEJA, CONSERVE
-#  --------------------------------
+#  CONTENU
+#  -------
 #    - cercle hierarchique (sunburst) pilote par 4 selecteurs de segment,
 #      cliquable, qui synchronise le filtre
-#    - barres des anomalies les plus critiques
-#    - forest plot intervalle / prediction / valeur observee
 #    - cartes de synthese
-#    - selecteurs maille + valeur
+#    - barres des anomalies les plus critiques, agregees sur les axes actifs
+#    - forest plot intervalle / prediction / valeur observee
+#    - evolution de la cible sur les 10 derniers trimestres
+#    - tableau de priorisation
 #
-#  CE QUI EST AJOUTE
-#  -----------------
-#    1. AXES D'AGREGATION (ruban de boutons, un par dimension). C'est la
-#       demande "pouvoir regarder juste 2 dimensions au lieu de 3" : les barres
-#       s'agregent sur les seules dimensions actives, et les libelles suivent.
-#    2. EVOLUTION DE LA CIBLE sur les 10 derniers trimestres (mission 1)
-#    3. DECOMPOSITION SHAP en cascade (mission 2)
-#    4. EVOLUTION DES 5 VARIABLES DETERMINANTES (mission 2)
-#    5. TABLEAU DE PRIORISATION en bas, filtre sur le perimetre courant
-#  Tout se met a jour ensemble, sur les memes selecteurs.
-#
-#  DEUX CORRECTIONS PAR RAPPORT A VOTRE VERSION
-#  ---------------------------------------------
-#    a) Le "None" qui s'affiche sous vos selecteurs vient d'un display()
-#       imbrique dans _bandeau() : _bandeau recoit None et l'imprime. Corrige.
-#    b) Le forest plot passait l'axe en echelle logarithmique
-#       (LOG_FOREST = True). La consigne du projet interdit tout logarithme,
-#       axes compris. Remplace par une VUE NORMALISEE z = (obs - centre) /
-#       demi-largeur, qui est une division et non une transformation non
-#       lineaire : tous les intervalles deviennent [-1, +1] et la position de
-#       l'observation se lit directement en nombre de demi-largeurs. C'est la
-#       meme solution que celle deja retenue dans graphiques_conformal.py.
-#       L'echelle en montants reste disponible dans le ruban.
+#  CORRECTIONS APPORTEES A LA VERSION PRECEDENTE
+#  ----------------------------------------------
+#  1. LE CERCLE QUI DISPARAIT APRES 3 OU 4 NIVEAUX. Cause reelle, reproduite :
+#     branchvalues="total" impose a Plotly que la valeur d'un parent soit
+#     superieure ou egale a la somme de ses enfants. Deux groupby independants
+#     sur les memes donnees ne donnent pas exactement la meme somme en virgule
+#     flottante (0,1 + 0,2 + 0,3 vaut 0,6000000000000001 alors que la somme
+#     directe vaut 0,6). Des trois niveaux, l'ecart apparait et Plotly refuse
+#     d'afficher TOUT le cercle, sans le moindre message.
+#     Corrige en passant a branchvalues="remainder" avec une valeur nulle sur
+#     les parents : Plotly calcule lui-meme la somme des enfants, il n'y a
+#     donc plus aucune contrainte a satisfaire ni aucun echec possible.
+#     Le separateur d'identifiants passe aussi de "/" a un caractere qui ne
+#     peut pas apparaitre dans les donnees, pour eviter qu'une modalite
+#     contenant une barre oblique ne casse la hierarchie.
+#  2. Barres et forest plot ne sont plus cote a cote : chacun occupe toute la
+#     largeur et se deroule sur sa propre hauteur.
+#  3. SHAP entierement retire (waterfall et panneau des variables).
+#  4. Numerotation des sections retiree.
+#  5. Echelle de gravite du cercle en notation courte : 200k, 1M, 8M.
 # =============================================================================
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML
 
 # ┌──────────────────────────── PARAMETRES ────────────────────────────┐
 TOP_N_PANNEAUX = 12       # barres et forest plot
-N_TRIMESTRES   = 10       # enonce mission 1
-N_VARS_SHAP    = 5        # enonce mission 2
+N_TRIMESTRES   = 10       # historique affiche
 N_UNITES_LISTE = 30       # unites proposees dans le selecteur
 N_LIGNES_TABLE = 15       # lignes du tableau du bas
 COL_SCORE      = "score_composite"
 COL_GWP        = "GWP"
 ECHELLE        = "Bluered"
-CHEMIN_MODELE  = "artefacts_modele/modele_final.joblib"
 VUE_GENERALE   = ""
 # └─────────────────────────────────────────────────────────────────────┘
 
+#  Separateur interne des identifiants du cercle. Le caractere U+001F ne peut
+#  pas apparaitre dans un libelle metier, contrairement a "/".
+SEP = "\x1f"
+
 _ENCRE, _ACCENT, _OK = "#141B34", "#c0392b", "#3D5A9E"
 _BLEU, _GRILLE, _GRIS = "#636EFA", "#EDF1F7", "#8A93A5"
-_DOUX = ["#6C8EBF", "#82B366", "#C08552", "#9673A6", "#5F9EA0"]
 _VIDE = "rgba(0,0,0,0)"
 
 
@@ -101,7 +97,7 @@ def _mise_en_forme(fig, hauteur, marges=None):
     fig.update_layout(
         template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
         font=dict(family="Inter, system-ui, sans-serif", size=12, color=_GRIS),
-        height=hauteur, separators=", ",
+        height=hauteur, autosize=True, separators=", ",
         hoverlabel=dict(bgcolor="white", bordercolor=_GRILLE, align="left",
                         font=dict(size=12.5, color=_ENCRE)),
         margin=marges or dict(l=10, r=40, t=95, b=45))
@@ -143,8 +139,8 @@ class _Socle:
 
         #  Index de cles, construits une fois. Sans eux chaque changement de
         #  selection relirait df en entier pour chaque sous-portefeuille.
-        self._cle_df = df[self.cles].astype(str).agg("\x1f".join, axis=1).values
-        self._cle_ex = self.ex[self.cles].agg("\x1f".join, axis=1).values
+        self._cle_df = df[self.cles].astype(str).agg(SEP.join, axis=1).values
+        self._cle_ex = self.ex[self.cles].agg(SEP.join, axis=1).values
 
     # ------------------------------------------------------------ filtrage
     def filtrer(self, colonne, valeur):
@@ -166,8 +162,7 @@ class _Socle:
     def agreger(self, sub, axes, top_n):
         """Agrege les anomalies sur les seules dimensions actives.
 
-        C'est ici que se joue la demande "regarder 2 dimensions au lieu de 3" :
-        avec moins d'axes, les anomalies d'un meme partenaire se cumulent au
+        Avec moins d'axes, les anomalies d'un meme partenaire se cumulent au
         lieu d'apparaitre eclatees, et le classement change de sens.
         """
         axes = [a for a in axes if a in sub.columns] or self.cles[:1]
@@ -198,7 +193,7 @@ class _Socle:
 
     # -------------------------------------------------------- historique
     def historique(self, cle, n=N_TRIMESTRES):
-        h = self.df[self._cle_df == "\x1f".join(cle)]
+        h = self.df[self._cle_df == SEP.join(cle)]
         if not len(h):
             return None, []
         h = (h.sort_values("time_idx") if "time_idx" in h.columns
@@ -208,7 +203,7 @@ class _Socle:
         return h, per
 
     def contexte(self, cle):
-        t = self.ex[self._cle_ex == "\x1f".join(cle)]
+        t = self.ex[self._cle_ex == SEP.join(cle)]
         if not len(t):
             return None
         r = t.iloc[0]
@@ -219,93 +214,49 @@ class _Socle:
 
     # ------------------------------------------------------- hierarchie
     def hierarchie(self, chemin):
+        """Noeuds du cercle, un par combinaison de chaque niveau.
+
+        `valeur_secteur` vaut le score reel sur les FEUILLES et zero sur les
+        parents. Avec branchvalues="remainder", Plotly additionne lui-meme les
+        enfants pour dimensionner un parent : plus aucune contrainte
+        "parent >= somme des enfants" a satisfaire, donc plus aucun cercle
+        blanc a partir de trois ou quatre niveaux. `score_total` conserve
+        l'agregat reel pour le survol et les pourcentages affiches.
+        """
+        prof_max = len(chemin)
+        agg = {"score_total": (COL_SCORE, "sum"),
+               "score_moyen": (COL_SCORE, "mean"),
+               "score_max": (COL_SCORE, "max"), "n": (COL_SCORE, "size")}
+        if COL_GWP in self.dd.columns:
+            agg["gwp"] = (COL_GWP, "sum")
+
         lignes = []
-        for prof in range(1, len(chemin) + 1):
+        for prof in range(1, prof_max + 1):
             cols = chemin[:prof]
-            agg = {"score_total": (COL_SCORE, "sum"),
-                   "score_moyen": (COL_SCORE, "mean"),
-                   "score_max": (COL_SCORE, "max"), "n": (COL_SCORE, "size")}
-            if COL_GWP in self.dd.columns:
-                agg["gwp"] = (COL_GWP, "sum")
             g = self.dd.groupby(cols, observed=True).agg(**agg).reset_index()
             for _, r in g.iterrows():
                 vals = [str(r[c]) for c in cols]
+                total = float(r["score_total"])
+                if not np.isfinite(total):
+                    continue
                 lignes.append({
-                    "id": "/".join(vals), "label": vals[-1],
-                    "parent": "/".join(vals[:-1]) if prof > 1 else "",
-                    "profondeur": prof, "score_total": r["score_total"],
-                    "score_moyen": r["score_moyen"], "score_max": r["score_max"],
-                    "n": int(r["n"]), "gwp": r.get("gwp", np.nan)})
+                    "id": SEP.join(vals), "label": vals[-1],
+                    "parent": SEP.join(vals[:-1]) if prof > 1 else "",
+                    "profondeur": prof, "score_total": total,
+                    "valeur_secteur": total if prof == prof_max else 0.0,
+                    "score_moyen": float(r["score_moyen"]),
+                    "score_max": float(r["score_max"]), "n": int(r["n"]),
+                    "gwp": float(r["gwp"]) if "gwp" in g.columns else np.nan})
         return pd.DataFrame(lignes)
 
 
 # =============================================================================
-#  2. SHAP LOCAL, avec cache
-# =============================================================================
-class _Shap:
-    def __init__(self, modele=None, x_model=None, chemin=CHEMIN_MODELE):
-        self.cache, self.explainer, self.raison = {}, None, None
-        self.x_model, self.feats, self.mdl = x_model, [], None
-        try:
-            import shap                                      # noqa: F401
-        except ImportError:
-            self.raison = "Paquet `shap` absent (pip install shap)."
-            return
-        try:
-            if modele is None:
-                import joblib
-                art = joblib.load(chemin)
-                modele = (next(v for v in art.values() if hasattr(v, "predict"))
-                          if isinstance(art, dict) else art)
-            mdl = (modele.named_steps["model"]
-                   if hasattr(modele, "named_steps") else modele)
-            self.feats = (list(mdl.feature_name_) if hasattr(mdl, "feature_name_")
-                          else list(mdl.feature_names_in_))
-            self.mdl = mdl
-            self.explainer = shap.TreeExplainer(mdl)
-        except Exception as e:
-            self.raison = f"Modele indisponible pour SHAP : {str(e)[:90]}"
-
-    @property
-    def actif(self):
-        return self.explainer is not None
-
-    def decomposer(self, cle, ligne):
-        if not self.actif or ligne is None or not len(ligne):
-            return None
-        if cle in self.cache:
-            return self.cache[cle]
-        try:
-            if self.x_model is not None:
-                x = self.x_model.loc[ligne.index, self.feats]
-            else:
-                absentes = [f for f in self.feats if f not in ligne.columns]
-                if absentes:
-                    raise KeyError(f"{len(absentes)} variable(s) du modele "
-                                   f"absente(s) de df (ex. {absentes[:2]})")
-                x = ligne[self.feats].copy()
-                for c in x.columns:
-                    if x[c].dtype == object:
-                        x[c] = x[c].astype("category")
-            sv = np.asarray(self.explainer.shap_values(x)).ravel()
-            base = float(np.ravel(self.explainer.expected_value)[0])
-            contrib = pd.Series(sv, index=self.feats)
-            pred = float(self.mdl.predict(x)[0])
-            res = dict(base=base, contrib=contrib, pred=pred,
-                       ecart=abs(base + contrib.sum() - pred))
-        except Exception as e:
-            res = dict(erreur=f"{type(e).__name__} : {str(e)[:100]}")
-        self.cache[cle] = res
-        return res
-
-
-# =============================================================================
-#  3. CREATION DES FIGURES (structure figee, seules les donnees changent)
+#  2. CREATION DES FIGURES (structure figee, seules les donnees changent)
 # =============================================================================
 def _creer_cercle():
     fig = go.Figure(go.Sunburst(ids=[], labels=[], parents=[], values=[],
-                                branchvalues="total"))
-    _mise_en_forme(fig, 600, dict(l=10, r=10, t=100, b=15))
+                                branchvalues="remainder"))
+    _mise_en_forme(fig, 620, dict(l=10, r=10, t=100, b=15))
     return go.FigureWidget(fig)
 
 
@@ -313,8 +264,9 @@ def _creer_barres():
     fig = go.Figure(go.Bar(x=[], y=[], orientation="h", showlegend=False,
                            marker=dict(colorscale=ECHELLE, cmin=0, cmax=1,
                                        line=dict(width=.5, color="white"))))
-    fig.update_layout(xaxis_title="Score cumule", yaxis=dict(tickfont=dict(size=9)))
-    _mise_en_forme(fig, 520, dict(l=10, r=30, t=95, b=45))
+    fig.update_layout(xaxis_title="Score cumule",
+                      yaxis=dict(tickfont=dict(size=10)))
+    _mise_en_forme(fig, 520, dict(l=10, r=40, t=95, b=50))
     return go.FigureWidget(fig)
 
 
@@ -331,9 +283,9 @@ def _creer_forest():
     fig.add_scatter(x=[], y=[], mode="markers", name="Valeur observee",
                     marker=dict(size=13, color=_ACCENT,
                                 line=dict(color="#7b241c", width=1.3)))  # 3 obs
-    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.03,
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                   xanchor="center", x=.5))
-    _mise_en_forme(fig, 520, dict(l=10, r=40, t=110, b=50))
+    _mise_en_forme(fig, 520, dict(l=10, r=50, t=115, b=55))
     return go.FigureWidget(fig)
 
 
@@ -363,66 +315,22 @@ def _creer_evolution(target):
     fig.update_xaxes(showgrid=False, linecolor=_GRILLE, showspikes=True,
                      spikemode="across", spikethickness=1.2, spikedash="dot",
                      spikecolor=_GRIS, title_text="<b>Trimestre</b>")
-    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat=",.0f",
+    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat="~s",
                      title_text=f"<b>{target}</b>")
-    _mise_en_forme(fig, 400, dict(l=85, r=45, t=95, b=45))
+    _mise_en_forme(fig, 420, dict(l=85, r=45, t=95, b=45))
     fig.update_layout(hovermode="x unified",
                       legend=dict(orientation="h", y=1.06, x=1,
                                   xanchor="right", font=dict(size=11)))
     return go.FigureWidget(fig)
 
 
-def _creer_shap():
-    fig = go.Figure(go.Waterfall(
-        orientation="v", x=[], y=[], measure=[], text=[],
-        textposition="outside", textfont=dict(size=10),
-        connector=dict(line=dict(color=_GRILLE, width=1)),
-        increasing=dict(marker=dict(color=_ACCENT)),
-        decreasing=dict(marker=dict(color=_OK)),
-        totals=dict(marker=dict(color=_ENCRE))))
-    fig.update_xaxes(showgrid=False, linecolor=_GRILLE, tickangle=-30,
-                     tickfont=dict(size=10))
-    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat=",.0f")
-    _mise_en_forme(fig, 430, dict(l=70, r=30, t=95, b=110))
-    return go.FigureWidget(fig)
-
-
-def _creer_variables(n=N_VARS_SHAP):
-    fig = make_subplots(rows=n, cols=1, shared_xaxes=True,
-                        vertical_spacing=.045, subplot_titles=[" "] * n)
-    for i in range(n):
-        c = _DOUX[i % len(_DOUX)]
-        fig.add_scatter(x=[], y=[], mode="lines+markers", showlegend=False,
-                        line=dict(color=c, width=2.3, shape="spline",
-                                  smoothing=.55),
-                        marker=dict(size=6, color="white",
-                                    line=dict(color=c, width=1.8)),
-                        row=i + 1, col=1)
-        fig.add_scatter(x=[], y=[], mode="markers", showlegend=False,
-                        hoverinfo="skip",
-                        marker=dict(size=12, color=c,
-                                    line=dict(color="white", width=2.2)),
-                        row=i + 1, col=1)
-    fig.update_xaxes(showgrid=False, showticklabels=False, linecolor=_GRILLE)
-    fig.update_xaxes(showticklabels=True, title_text="<b>Trimestre</b>",
-                     row=n, col=1)
-    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickfont=dict(size=9))
-    _mise_en_forme(fig, 150 * n + 120, dict(l=70, r=30, t=95, b=45))
-    fig.update_layout(hovermode="x unified")
-    for a in fig.layout.annotations:
-        a.update(x=0, xanchor="left", font=dict(size=11, color=_GRIS))
-    return go.FigureWidget(fig)
-
-
 def _vider(fw, message, hauteur=260):
-    """Vide vraiment : x, y, text, mesures et annotations."""
+    """Vide vraiment : x, y, text et annotations."""
     with fw.batch_update():
         for t in fw.data:
             t.x, t.y = [], []
             if "text" in t:
                 t.text = []
-            if t.type == "waterfall":
-                t.measure = []
             if t.type == "sunburst":
                 t.ids, t.labels, t.parents, t.values = [], [], [], []
         for a in fw.layout.annotations:
@@ -433,23 +341,19 @@ def _vider(fw, message, hauteur=260):
 
 
 # =============================================================================
-#  4. LE TABLEAU DE BORD
+#  3. LE TABLEAU DE BORD
 # =============================================================================
 def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
-                           alpha=None, modele=None, x_model=None,
-                           top_n=TOP_N_PANNEAUX):
+                           alpha=None, top_n=TOP_N_PANNEAUX):
     id_cols = id_cols if id_cols is not None else _session("ID_COLS")[1]
     target = target if target is not None else _session("TARGET")[1]
     if alpha is None:
         ok, a = _session("ALPHA")
         alpha = a if ok else .10
-    if modele is None:
-        modele = _session("MODELE_TE")[1]
     if id_cols is None or target is None:
         raise NameError("ID_COLS et TARGET doivent exister dans la session.")
 
     socle = _Socle(anomalies_prio, expl, df, id_cols, target, alpha)
-    shap_moteur = _Shap(modele=modele, x_model=x_model)
     cles = socle.cles
 
     # ------------------------------------------------------------- widgets
@@ -463,36 +367,32 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
 
     sel_maille = widgets.Dropdown(
         options=[(c, c) for c in cles], value=defauts[0],
-        description="1 · Maille :", layout=widgets.Layout(width="330px"),
-        style={"description_width": "90px"})
+        description="Maille :", layout=widgets.Layout(width="330px"),
+        style={"description_width": "72px"})
     sel_valeur = widgets.Dropdown(
         options=[("— vue generale —", VUE_GENERALE)], value=VUE_GENERALE,
-        description="2 · Valeur :", layout=widgets.Layout(width="470px"),
-        style={"description_width": "90px"})
+        description="Valeur :", layout=widgets.Layout(width="470px"),
+        style={"description_width": "72px"})
     sel_unite = widgets.Dropdown(
-        options=[], description="3 · Unite :",
+        options=[], description="Unite :",
         layout=widgets.Layout(width="640px"),
-        style={"description_width": "90px"})
+        style={"description_width": "72px"})
 
-    #  RUBAN DES AXES D'AGREGATION : c'est la nouveaute demandee. Un bouton par
-    #  dimension ; desactiver une dimension fait fusionner les anomalies qui
-    #  n'en differaient que par elle.
+    #  Un bouton par dimension : desactiver une dimension fait fusionner les
+    #  anomalies qui n'en differaient que par elle.
     axes_btns = [widgets.ToggleButton(
         value=True, description=c, layout=widgets.Layout(width="auto"),
         button_style="info") for c in cles]
 
     sel_echelle = widgets.ToggleButtons(
         options=[("Ecart normalise", "z"), ("Montants", "lin")], value="z",
-        style={"button_width": "auto"},
-        layout=widgets.Layout(width="auto"))
+        style={"button_width": "auto"}, layout=widgets.Layout(width="auto"))
 
     # ------------------------------------------------------------ figures
     fw_cercle = _creer_cercle()
     fw_barres = _creer_barres()
     fw_forest = _creer_forest()
     fw_evol = _creer_evolution(target)
-    fw_shap = _creer_shap()
-    fw_vars = _creer_variables()
     z_cartes, z_table = widgets.Output(), widgets.Output()
     verrou = {"actif": False}
 
@@ -512,8 +412,8 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
     def _maj_cercle(*_):
         chemin = _chemin()
         if not chemin:
-            #  On revient a la couche par defaut au lieu de vider le cercle.
-            #  Un cercle blanc laisse croire a un plantage.
+            #  Retour a la couche par defaut plutot qu'un cercle vide : un
+            #  cercle blanc laisse croire a un plantage.
             chemin = [defauts[0]]
         try:
             h = socle.hierarchie(chemin)
@@ -537,20 +437,24 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             with fw_cercle.batch_update():
                 t = fw_cercle.data[0]
                 t.ids, t.labels = h["id"].tolist(), h["label"].tolist()
-                t.parents, t.values = h["parent"].tolist(), h["score_total"].tolist()
+                t.parents = h["parent"].tolist()
+                #  Valeur reelle sur les feuilles, zero sur les parents :
+                #  Plotly somme lui-meme, aucune contrainte a satisfaire.
+                t.values = h["valeur_secteur"].tolist()
+                t.branchvalues = "remainder"
                 t.text = [f"{100 * v / max(socle.score_global, 1e-12):.0f} %"
                           for v in h["score_total"]]
                 t.texttemplate = "%{label}<br>%{text}"
                 t.hovertext, t.hoverinfo = survol, "text"
                 t.insidetextorientation = "radial"
                 t.maxdepth = len(chemin)
-                t.marker = dict(colors=h["score_moyen"].tolist(),
-                                colorscale=ECHELLE, cmin=0, cmax=cmax,
-                                line=dict(color="white", width=1.6),
-                                colorbar=dict(title="Gravite<br>moyenne",
-                                              thickness=16, len=.7,
-                                              tickformat=".2g"))
-                fw_cercle.layout.height = 600
+                t.marker = dict(
+                    colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
+                    cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
+                    #  Notation courte : 200k, 1M, 8M au lieu de 2.0e+5.
+                    colorbar=dict(title="Gravite<br>moyenne", thickness=16,
+                                  len=.7, tickformat="~s"))
+                fw_cercle.layout.height = 620
                 fw_cercle.layout.title = dict(
                     text=f"Repartition des anomalies  ·  {' › '.join(chemin)}",
                     font=dict(size=15), x=.015, xanchor="left")
@@ -614,7 +518,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             t.x, t.y = g["score_total"].tolist(), g["libelle"].tolist()
             t.marker.color = g["score_total"].rank(pct=True).tolist()
             t.text, t.hovertemplate = survol, "%{text}<extra></extra>"
-            fw_barres.layout.height = max(360, 34 * len(g) + 150)
+            fw_barres.layout.height = max(380, 38 * len(g) + 150)
             fw_barres.layout.title = dict(
                 text=f"Les {len(g)} plus critiques  ·  agrege sur "
                      f"{' + '.join(axes)}<br><sup>{titre}</sup>",
@@ -677,38 +581,29 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             fw_forest.data[3].hovertemplate = "%{text}<extra></extra>"
             fw_forest.layout.xaxis.type = "linear"
             fw_forest.layout.xaxis.title.text = titre_x
+            fw_forest.layout.xaxis.tickformat = "~s" if sel_echelle.value == "lin" \
+                else ""
             fw_forest.layout.yaxis = dict(tickmode="array", tickvals=y,
-                                          ticktext=ticks, tickfont=dict(size=9))
-            fw_forest.layout.height = max(400, 40 * len(d) + 170)
+                                          ticktext=ticks, tickfont=dict(size=10))
+            fw_forest.layout.height = max(420, 44 * len(d) + 175)
             fw_forest.layout.title = dict(
                 text=f"Intervalle conforme, prediction et valeur observee"
                      f"<br><sup>{titre}</sup>",
                 font=dict(size=14), x=.015, xanchor="left")
 
-    # ------------------------------------------------- evolution et SHAP
+    # --------------------------------------------------------- evolution
     def _maj_unite(*_):
         cle = sel_unite.value
         if cle is None:
-            for fw in (fw_evol, fw_shap, fw_vars):
-                _vider(fw, "Aucun sous-portefeuille dans ce perimetre.")
+            _vider(fw_evol, "Aucun sous-portefeuille dans ce perimetre.")
             return
         try:
             h, per = socle.historique(cle)
             ctx = socle.contexte(cle)
             _maj_evolution(h, per, ctx, cle)
-            if not shap_moteur.actif:
-                raison = shap_moteur.raison or "SHAP indisponible."
-                _vider(fw_shap, raison)
-                _vider(fw_vars, raison)
-                return
-            dec = shap_moteur.decomposer(cle, h.iloc[[-1]] if h is not None
-                                         and len(h) else None)
-            _maj_shap(dec)
-            _maj_variables(dec, h, per, ctx)
         except Exception as e:
-            msg = f"Mise a jour impossible : {type(e).__name__} : {str(e)[:110]}"
-            for fw in (fw_evol, fw_shap, fw_vars):
-                _vider(fw, msg)
+            _vider(fw_evol,
+                   f"Mise a jour impossible : {type(e).__name__} : {str(e)[:110]}")
 
     def _maj_evolution(h, per, ctx, cle):
         if h is None or not len(h):
@@ -739,7 +634,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             fw_evol.data[5].x, fw_evol.data[5].y = xh, yh
             fw_evol.data[5].marker.color = coul
             fw_evol.data[5].name = "Couvert" if couvert else "Hors intervalle"
-            fw_evol.layout.height = 400
+            fw_evol.layout.height = 420
             fw_evol.layout.title = dict(
                 text=f"<b style='color:{_ENCRE}'>{' | '.join(cle)}</b>"
                      f"<br><span style='font-size:11px'>{target} · {len(h)} "
@@ -748,83 +643,6 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
                      f"{fleche} {abs(delta):.1f} %</span>"
                      + (f" · periode validee <b>{ctx['per']}</b>" if ctx else "")
                      + "</span>", font=dict(size=14), x=.015, xanchor="left")
-
-    def _maj_shap(dec):
-        if dec is None:
-            _vider(fw_shap, "Decomposition SHAP indisponible.")
-            return
-        if "erreur" in dec:
-            _vider(fw_shap, f"SHAP : {dec['erreur']}")
-            return
-        contrib, base, pred = dec["contrib"], dec["base"], dec["pred"]
-        top = contrib.reindex(
-            contrib.abs().sort_values(ascending=False).index).head(N_VARS_SHAP)
-        reste = contrib.sum() - top.sum()
-        #  "Autres variables" ferme la cascade sur la prediction. Sans ce
-        #  terme, le graphique n'atterrirait pas sur la bonne valeur.
-        x = ["Base"] + list(top.index) + ["Autres variables", "Prediction"]
-        y = [base] + list(top.values) + [reste, 0]
-        mesure = ["absolute"] + ["relative"] * (len(top) + 1) + ["total"]
-        txt = ([_fmt(base)]
-               + [("+" if v >= 0 else "−") + _fmt(abs(v)) for v in top.values]
-               + [("+" if reste >= 0 else "−") + _fmt(abs(reste)), _fmt(pred)])
-        exact = dec["ecart"] < 1e-6 * max(abs(pred), 1.0)
-        with fw_shap.batch_update():
-            t = fw_shap.data[0]
-            t.x, t.y, t.measure, t.text = x, y, mesure, txt
-            t.hovertemplate = "<b>%{x}</b><br>%{text}<extra></extra>"
-            fw_shap.layout.height = 430
-            fw_shap.layout.title = dict(
-                text="<b>Decomposition SHAP locale</b>"
-                     f"<br><span style='font-size:11px'>base {_fmt(base)} + "
-                     f"contributions = prediction {_fmt(pred)} · "
-                     + (f"<span style='color:{_OK}'>reconstitution exacte</span>"
-                        if exact else
-                        f"<span style='color:{_ACCENT}'>ecart "
-                        f"{dec['ecart']:.3g}, A VERIFIER</span>")
-                     + "</span>", font=dict(size=14), x=.015, xanchor="left")
-
-    def _maj_variables(dec, h, per, ctx):
-        if dec is None or "erreur" in dec or h is None or not len(h):
-            _vider(fw_vars, "Evolution des variables indisponible.")
-            return
-        contrib = dec["contrib"]
-        top = contrib.reindex(
-            contrib.abs().sort_values(ascending=False).index).head(N_VARS_SHAP)
-        #  On ne remplace pas une variable non tracable par la 6e : l'enonce
-        #  demande les 5 plus determinantes, pas les 5 que l'on sait dessiner.
-        tracables = [v for v in top.index
-                     if v in h.columns and pd.api.types.is_numeric_dtype(h[v])]
-        ecartees = [v for v in top.index if v not in tracables]
-        k = per.index(ctx["per"]) if ctx and ctx["per"] in per else len(per) - 1
-        total = contrib.abs().sum() or 1.0
-        with fw_vars.batch_update():
-            for i in range(N_VARS_SHAP):
-                t_l, t_p = fw_vars.data[2 * i], fw_vars.data[2 * i + 1]
-                ann = fw_vars.layout.annotations[i]
-                if i < len(tracables):
-                    v = tracables[i]
-                    vv = h[v].values.astype(float)
-                    t_l.x, t_l.y = per, vv
-                    t_l.hovertemplate = (f"<b>%{{x}}</b><br>{v} : "
-                                         "<b>%{y:,.4g}</b><extra></extra>")
-                    t_p.x, t_p.y = [per[k]], [vv[k]]
-                    signe = "+" if contrib[v] >= 0 else "−"
-                    ann.text = (f"<b>{v}</b>   SHAP {signe}{_fmt(abs(contrib[v]))}"
-                                f"   ({100 * abs(contrib[v]) / total:.0f} %)")
-                    ann.font.color = _DOUX[i % len(_DOUX)]
-                else:
-                    t_l.x, t_l.y = [], []
-                    t_p.x, t_p.y = [], []
-                    ann.text = " "
-            fw_vars.layout.height = 150 * max(len(tracables), 1) + 120
-            fw_vars.layout.title = dict(
-                text=f"<b>{len(tracables)} variables les plus determinantes</b>"
-                     f"<br><span style='font-size:11px'>memes trimestres · "
-                     f"periode validee <b>{per[k]}</b>"
-                     + (f" · ecartees, non numeriques : {', '.join(ecartees)}"
-                        if ecartees else "") + "</span>",
-                font=dict(size=14), x=.015, xanchor="left")
 
     # ----------------------------------------------------------- le tableau
     def _maj_tableau(sub, titre):
@@ -889,8 +707,8 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             ancienne = sel_unite.value
             sel_unite.options = options
             dispo = [v for _, v in options]
-            #  On conserve l'unite courante si elle survit au filtre, sinon les
-            #  panneaux du bas sauteraient a chaque changement de perimetre.
+            #  On conserve l'unite courante si elle survit au filtre, sinon le
+            #  panneau du bas sauterait a chaque changement de perimetre.
             sel_unite.value = (ancienne if ancienne in dispo
                                else (dispo[0] if dispo else None))
         finally:
@@ -912,7 +730,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
     def _au_clic_cercle(trace, points, state):
         if not points.point_inds:
             return
-        parts = trace.ids[points.point_inds[0]].split("/")
+        parts = trace.ids[points.point_inds[0]].split(SEP)
         chemin = _chemin() or [defauts[0]]
         if not parts or len(parts) > len(chemin):
             return
@@ -951,7 +769,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
 
     # ---------------------------------------------------------- affichage
     display(_bandeau(
-        "<b>1 · Structure du cercle</b> — choisissez jusqu'a quatre niveaux "
+        "<b>Structure du cercle</b> — choisissez jusqu'a quatre niveaux "
         "d'emboitement." + ("  Le clic sur une part filtre les panneaux."
                             if clic else ""),
         fond="#e3f2fd", coul="#0d47a1"))
@@ -960,7 +778,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
     display(fw_cercle)
 
     display(_bandeau(
-        "<b>2 · Perimetre et granularite</b> — la maille et la valeur filtrent. "
+        "<b>Perimetre et granularite</b> — la maille et la valeur filtrent. "
         "Les boutons d'axes commandent l'agregation des barres, du forest plot "
         "et du tableau : desactivez-en un pour regrouper les anomalies qui n'en "
         "differaient que par lui.", fond="#e8f5e9", coul="#1b5e20"))
@@ -974,35 +792,36 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
                       "padding-right:8px'>Axe du forest plot :</b>"),
          sel_echelle], layout=widgets.Layout(align_items="center")))
     display(z_cartes)
-    display(widgets.HBox([fw_barres, fw_forest],
-                         layout=widgets.Layout(width="100%")))
+
+    #  Chaque graphique occupe toute la largeur et se deroule sur sa propre
+    #  hauteur, l'un sous l'autre : cote a cote, le plus long debordait et les
+    #  libelles se chevauchaient.
+    display(fw_barres)
+    display(fw_forest)
 
     display(_bandeau(
-        "<b>3 · Le sous-portefeuille en detail</b> — evolution de la cible sur "
-        f"{N_TRIMESTRES} trimestres, puis decomposition SHAP de la prediction "
-        "validee et evolution des variables qui la determinent.",
+        "<b>Le sous-portefeuille en detail</b> — evolution de la cible sur "
+        f"{N_TRIMESTRES} trimestres, avec l'intervalle conforme et le statut "
+        "de couverture sur la periode validee.",
         fond="#fff3e0", coul="#e65100"))
     display(sel_unite)
     display(fw_evol)
-    display(widgets.HBox([fw_shap, fw_vars],
-                         layout=widgets.Layout(width="100%")))
 
-    display(_bandeau("<b>4 · Tableau de priorisation</b> — perimetre courant, "
+    display(_bandeau("<b>Tableau de priorisation</b> — perimetre courant, "
                      f"{N_LIGNES_TABLE} lignes les plus graves."))
     display(z_table)
 
     _maj_cercle()
     _maj_valeurs()
     return {"cercle": fw_cercle, "barres": fw_barres, "forest": fw_forest,
-            "evolution": fw_evol, "shap": fw_shap, "variables": fw_vars,
-            "maille": sel_maille, "valeur": sel_valeur, "unite": sel_unite,
-            "axes": axes_btns, "echelle": sel_echelle, "cartes": z_cartes,
-            "tableau": z_table, "socle": socle, "shap_moteur": shap_moteur,
-            "rafraichir": _maj_panneaux}
+            "evolution": fw_evol, "maille": sel_maille, "valeur": sel_valeur,
+            "unite": sel_unite, "axes": axes_btns, "echelle": sel_echelle,
+            "niveaux": niveaux, "cartes": z_cartes, "tableau": z_table,
+            "socle": socle, "rafraichir": _maj_panneaux}
 
 
 # =============================================================================
-#  5. EXECUTION AUTOMATIQUE
+#  4. EXECUTION AUTOMATIQUE
 # =============================================================================
 #  Le tableau de bord se lance tout seul si vos donnees sont en session. Sinon,
 #  un message dit exactement ce qui manque, plutot que de laisser un ecran vide.
