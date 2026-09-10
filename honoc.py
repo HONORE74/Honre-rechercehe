@@ -2,34 +2,31 @@
 # =============================================================================
 #  TABLEAU DE BORD UNIFIE - anomalies, evolution, priorisation
 #
-#  UN SEUL BLOC, AUTONOME. Rien a executer avant, hormis d'avoir en session :
-#      anomalies_prio, expl, df, ID_COLS, TARGET      (ALPHA facultatif)
+#  UN SEUL BLOC, UNE SEULE BASE. Il suffit d'avoir en session :
+#      df, ID_COLS, TARGET            (ALPHA facultatif)
+#
+#  `anomalies_prio` et `expl` ne sont plus demandes. Tout est tire de `df`,
+#  qui contient a la fois l'historique complet, les colonnes de resultat
+#  (y_pred, borne_basse, borne_haute) sur la periode validee, et le score de
+#  priorisation valant zero pour ce qui n'est pas une anomalie.
+#
+#  COMMENT LES TROIS VUES SONT DERIVEES DE `df`
+#  ---------------------------------------------
+#    historique       = df en entier, tous les trimestres
+#    periode validee  = les lignes qui portent une prediction conforme,
+#                       c'est-a-dire dont borne_basse, borne_haute et y_pred
+#                       sont toutes renseignees. Si plusieurs trimestres en
+#                       portent, le plus recent est retenu et le code le dit.
+#    anomalies        = les lignes de la periode validee dont le score est
+#                       strictement positif
+#  Les trois sortent du meme tableau, elles sont donc coherentes par
+#  construction : il n'y a plus deux sources a tenir alignees a la main.
 #
 #  PILOTAGE
 #  --------
 #  Les AXES D'AGREGATION commandent tout : le cercle, les barres, le forest
-#  plot, la courbe d'evolution et le tableau. Activer ou desactiver une
-#  dimension regroupe ou eclate l'ensemble du tableau de bord d'un seul geste.
-#  La maille et la valeur filtrent ce peritmetre, et elles rafraichissent elles
-#  aussi tous les panneaux, cercle compris.
-#
-#  MODIFICATIONS DE CETTE VERSION
-#  -------------------------------
-#  1. UNE SEULE SOURCE POUR LES TROIS PANNEAUX. C'etait le vrai defaut : la
-#     courbe d'evolution lisait `expl` AGREGE sur les axes actifs, alors que le
-#     forest plot et le tableau lisaient `anomalies_prio` LIGNE PAR LIGNE sur
-#     la cle complete. Trois panneaux, trois `y_obs` differents pour le meme
-#     sous-portefeuille. Desormais une methode unique, `table_axes()`, agrege
-#     `expl` sur les axes actifs, et les trois panneaux la partagent. Le point
-#     observe de la courbe, celui du forest plot et la colonne Y_obs du
-#     tableau portent maintenant exactement la meme valeur.
-#  2. Les selecteurs de segment sont supprimes : ce sont les axes d'agregation
-#     qui structurent le cercle.
-#  3. Le ruban "Ecart normalise / Montants" est supprime. Le forest plot est
-#     toujours en montants, en notation courte.
-#  4. La carte "GWP total" est retiree des cartes de synthese.
-#  5. Les variables explicatives n'affichent plus que leur nom.
-#  6. Toutes les fleches d'evolution sont supprimees.
+#  plot, la courbe d'evolution et le tableau. La maille et la valeur filtrent
+#  le perimetre et rafraichissent eux aussi tous les panneaux, cercle compris.
 #
 #  UN POINT DE RIGUEUR A CONNAITRE
 #  --------------------------------
@@ -55,6 +52,10 @@ N_UNITES_LISTE = 30       # unites proposees dans le selecteur
 N_LIGNES_TABLE = 15       # lignes du tableau du bas
 N_VARS_EXPLIC  = 5        # variables explicatives sous la courbe
 COL_SCORE      = "score_composite"
+COL_OBS        = "y_obs"          # a defaut, la cible elle-meme est utilisee
+COL_PRED       = "y_pred"
+COL_LO, COL_HI = "borne_basse", "borne_haute"
+PERIODE_VALIDEE = "auto"  # "auto" ou un couple explicite, ex. (2024, 4)
 ECHELLE        = "Bluered"
 VUE_GENERALE   = ""
 # └─────────────────────────────────────────────────────────────────────┘
@@ -124,30 +125,66 @@ def _bandeau(txt, fond="#eceff1", coul="#37474f"):
 
 
 # =============================================================================
-#  1. SOCLE DE DONNEES
+#  1. SOCLE DE DONNEES - tout est derive de `df`
 # =============================================================================
 class _Socle:
     """Prepare une fois ce que les mises a jour reliront des dizaines de fois."""
 
-    def __init__(self, anomalies_prio, expl, df, id_cols, target, alpha):
+    def __init__(self, df, id_cols, target, alpha, verbeux=True):
         self.df, self.target, self.alpha = df, target, alpha
-        self.cles = [c for c in id_cols
-                     if c in anomalies_prio.columns and c in expl.columns
-                     and c in df.columns]
+        self.cles = [c for c in id_cols if c in df.columns]
         if not self.cles:
-            raise ValueError(
-                "Aucune colonne d'identification commune entre anomalies_prio, "
-                f"expl et df. ID_COLS fourni : {list(id_cols)}")
+            raise ValueError(f"Aucune colonne de ID_COLS n'est dans df : "
+                             f"{list(id_cols)}")
+        if target not in df.columns:
+            raise ValueError(f"TARGET '{target}' absent de df.")
 
-        self.dd = anomalies_prio.copy()
-        self.ex = expl.copy()
+        #  --- la periode validee : les lignes qui portent une prediction ---
+        #  Une ligne appartient a la periode validee si et seulement si elle
+        #  porte un intervalle conforme. C'est un marqueur plus sur que "le
+        #  dernier trimestre" : il vient de la donnee, pas d'une convention.
+        cp = [c for c in (COL_LO, COL_HI, COL_PRED) if c in df.columns]
+        if not cp:
+            raise ValueError(
+                f"df ne contient aucune des colonnes {COL_LO}, {COL_HI}, "
+                f"{COL_PRED} : impossible d'identifier la periode validee.")
+        porte_cp = df[cp].notna().all(axis=1)
+        if not porte_cp.any():
+            raise ValueError("Aucune ligne de df ne porte de prediction "
+                             f"conforme ({cp} tous renseignes).")
+
+        ex = df[porte_cp]
+        self.periode = None
+        if {"year", "quarter"} <= set(df.columns):
+            couples = sorted(set(zip(ex["year"].astype(int),
+                                     ex["quarter"].astype(int))))
+            self.periode = (tuple(PERIODE_VALIDEE)
+                            if PERIODE_VALIDEE != "auto" else couples[-1])
+            if len(couples) > 1 and verbeux:
+                print(f"Note : {len(couples)} trimestres portent une "
+                      f"prediction {couples}. Le plus recent est retenu "
+                      f"({self.periode[0]}-T{self.periode[1]}) ; sommer "
+                      "plusieurs periodes fausserait les montants agreges.")
+            ex = ex[(ex["year"].astype(int) == self.periode[0])
+                    & (ex["quarter"].astype(int) == self.periode[1])]
+
+        self.ex = ex.copy()
+        #  y_obs : la colonne dediee si elle existe, sinon la cible elle-meme.
+        if COL_OBS not in self.ex.columns:
+            self.ex[COL_OBS] = self.ex[target].values
+
+        #  --- les anomalies : score strictement positif ---
+        if COL_SCORE in self.ex.columns:
+            score = pd.to_numeric(self.ex[COL_SCORE], errors="coerce").fillna(0)
+            self.ex[COL_SCORE] = score
+            self.dd = self.ex[score > 0].copy()
+        else:
+            raise ValueError(f"Colonne de score '{COL_SCORE}' absente de df.")
+
         for c in self.cles:
             self.dd[c] = self.dd[c].astype(str)
             self.ex[c] = self.ex[c].astype(str)
-        if COL_SCORE in self.dd.columns:
-            self.dd = self.dd.dropna(subset=[COL_SCORE])
-        self.score_global = float(self.dd[COL_SCORE].sum()) \
-            if COL_SCORE in self.dd.columns else 0.0
+        self.score_global = float(self.dd[COL_SCORE].sum()) or 1.0
 
         #  Cles textuelles de df, par axe. Construites une fois : sans elles,
         #  chaque changement de selection relirait df en entier.
@@ -159,6 +196,28 @@ class _Socle:
             c for c in df.columns
             if c != target and c not in _EXCLURE_VARS
             and pd.api.types.is_numeric_dtype(df[c])]
+
+        if verbeux:
+            per_txt = (f"{self.periode[0]}-T{self.periode[1]}"
+                       if self.periode else "non datee")
+            hist = ""
+            if {"year", "quarter"} <= set(df.columns):
+                tous = sorted(set(zip(df["year"].astype(int),
+                                      df["quarter"].astype(int))))
+                hist = (f"   historique       : {tous[0][0]}-T{tous[0][1]} "
+                        f"-> {tous[-1][0]}-T{tous[-1][1]}  "
+                        f"({len(tous)} trimestres)\n")
+            print("=" * 74)
+            print(f"SOURCE UNIQUE : df   ·   {len(df):,} lignes".replace(",", " "))
+            print("=" * 74)
+            print(hist
+                  + f"   periode validee  : {per_txt}  "
+                    f"({len(self.ex):,} lignes)".replace(",", " ") + "\n"
+                  + f"   dont anomalies   : {len(self.dd):,} "
+                    f"(score > 0)".replace(",", " ") + "\n"
+                  + f"   axes disponibles : {', '.join(self.cles)}\n"
+                  + f"   variables suivies: {len(self.vars_explic)}")
+            print("=" * 74)
 
     # ------------------------------------------------------------ filtrage
     def filtrer(self, colonne, valeur):
@@ -179,36 +238,40 @@ class _Socle:
     # ================================================================
     #  LA SOURCE UNIQUE : tous les panneaux passent par ici
     # ================================================================
-    def table_axes(self, sub, sub_ex, axes):
-        """Agrege `expl` sur les axes actifs et y joint le score des anomalies.
+    def table_axes(self, sub_ex, axes):
+        """Agrege la periode validee sur les axes actifs.
 
-        C'est la methode centrale de ce fichier. Le forest plot, le tableau de
-        priorisation et le point observe de la courbe d'evolution en sortent
-        tous les trois, donc ils ne peuvent plus se contredire : un meme
-        sous-portefeuille affiche le meme y_obs partout.
+        Le forest plot, les barres, le tableau de priorisation et le point
+        observe de la courbe d'evolution en sortent tous, donc ils ne peuvent
+        plus se contredire : un meme sous-portefeuille affiche le meme y_obs
+        partout. Le score est somme dans le meme mouvement, et les groupes
+        sans aucune anomalie (score cumule nul) sont ecartes.
 
-        Les montants sont sommes, y compris les bornes conformes. La somme est
-        le bon agregat pour des montants, mais elle fait perdre la garantie de
+        Les montants sont sommes, bornes conformes comprises. La somme est le
+        bon agregat pour des montants, mais elle fait perdre la garantie de
         couverture du conforme, ce que le titre des figures signale.
         """
         axes = [a for a in axes if a in sub_ex.columns] or self.cles[:1]
+        colonnes = ["y_obs", "y_pred", "lo", "hi", "score", "n", "libelle",
+                    "couvert", "n_lignes", "score_max"]
         if not len(sub_ex):
-            return pd.DataFrame(columns=axes + ["y_obs", "y_pred", "lo", "hi",
-                                                "score", "n", "libelle",
-                                                "couvert"])
-        montants = {"y_obs": ("y_obs", "sum"), "y_pred": ("y_pred", "sum"),
-                    "lo": ("borne_basse", "sum"), "hi": ("borne_haute", "sum"),
-                    "n_lignes": ("y_obs", "size")}
-        t = sub_ex.groupby(axes, observed=True).agg(**montants).reset_index()
+            return pd.DataFrame(columns=axes + colonnes)
 
-        if len(sub) and COL_SCORE in sub.columns:
-            s = (sub.groupby(axes, observed=True)
-                 .agg(score=(COL_SCORE, "sum"), score_max=(COL_SCORE, "max"),
-                      n=(COL_SCORE, "size")).reset_index())
-            t = t.merge(s, on=axes, how="inner")   # on ne garde que les anomalies
-        else:
-            t["score"], t["score_max"], t["n"] = 0.0, 0.0, 0
+        agg = {"y_obs": (COL_OBS, "sum"), "y_pred": (COL_PRED, "sum"),
+               "lo": (COL_LO, "sum"), "hi": (COL_HI, "sum"),
+               "score": (COL_SCORE, "sum"), "score_max": (COL_SCORE, "max"),
+               "n_lignes": (COL_OBS, "size")}
+        t = sub_ex.groupby(axes, observed=True).agg(**agg).reset_index()
 
+        #  Nombre d'anomalies du groupe, distinct du nombre de lignes : le
+        #  groupe peut contenir des lignes saines, qui comptent dans les
+        #  montants mais pas dans le decompte d'anomalies.
+        n_ano = (sub_ex[sub_ex[COL_SCORE] > 0]
+                 .groupby(axes, observed=True).size().rename("n").reset_index())
+        t = t.merge(n_ano, on=axes, how="left")
+        t["n"] = t["n"].fillna(0).astype(int)
+
+        t = t[t["score"] > 0]                    # groupes sans anomalie ecartes
         t["couvert"] = (t["y_obs"] >= t["lo"]) & (t["y_obs"] <= t["hi"])
         t["libelle"] = t[axes].astype(str).agg(" | ".join, axis=1).str.slice(0, 38)
         return t.sort_values("score", ascending=False).reset_index(drop=True)
@@ -235,7 +298,11 @@ class _Socle:
 
     # -------------------------------------------------------- historique
     def historique(self, valeurs, axes, n=N_TRIMESTRES):
-        """Historique du groupe defini par (axes, valeurs), somme par trimestre."""
+        """Historique du groupe defini par (axes, valeurs), somme par trimestre.
+
+        Lu dans `df` en entier, donc sur tous les trimestres, y compris ceux
+        qui ne portent aucune prediction.
+        """
         axes = [a for a in axes if a in self._df_txt] or self.cles[:1]
         d = self.df[self._masque(self._df_txt, axes, valeurs)]
         if not len(d):
@@ -264,10 +331,7 @@ class _Socle:
         if not len(t):
             return None
         r = t.iloc[0]
-        per = None
-        if {"year", "quarter"} <= set(self.ex.columns):
-            e = self.ex.iloc[0]
-            per = f"{int(e['year'])}-T{int(e['quarter'])}"
+        per = (f"{self.periode[0]}-T{self.periode[1]}" if self.periode else None)
         return dict(per=per, pred=float(r["y_pred"]), lo=float(r["lo"]),
                     hi=float(r["hi"]), obs=float(r["y_obs"]),
                     couvert=bool(r["couvert"]),
@@ -481,8 +545,8 @@ def _vider(fw, message, hauteur=260):
 # =============================================================================
 #  3. LE TABLEAU DE BORD
 # =============================================================================
-def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
-                           alpha=None, top_n=TOP_N_PANNEAUX):
+def tableau_de_bord_unifie(df, id_cols=None, target=None, alpha=None,
+                           top_n=TOP_N_PANNEAUX):
     id_cols = id_cols if id_cols is not None else _session("ID_COLS")[1]
     target = target if target is not None else _session("TARGET")[1]
     if alpha is None:
@@ -491,14 +555,12 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
     if id_cols is None or target is None:
         raise NameError("ID_COLS et TARGET doivent exister dans la session.")
 
-    socle = _Socle(anomalies_prio, expl, df, id_cols, target, alpha)
+    socle = _Socle(df, id_cols, target, alpha)
     cles = socle.cles
     defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk")
                           if c in cles), cles[0])
 
     # ------------------------------------------------------------- widgets
-    #  Les axes d'agregation remplacent les anciens selecteurs de segment :
-    #  ils structurent le cercle ET commandent tous les autres panneaux.
     axes_btns = [widgets.ToggleButton(
         value=(c in cles[:2]), description=c,
         layout=widgets.Layout(width="auto"),
@@ -578,14 +640,9 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
 
     # --------------------------------------------------------- les cartes
     def _cartes(sub, titre, table):
-        part = (sub[COL_SCORE].sum() / max(socle.score_global, 1e-12)
-                if COL_SCORE in sub.columns and len(sub) else 0)
+        part = (sub[COL_SCORE].sum() / socle.score_global if len(sub) else 0)
         grav = _fmt4(sub[COL_SCORE].mean()) if len(sub) else "—"
-        pire = "—"
-        if len(sub) and "rank" in sub.columns:
-            rk = sub.loc[sub[COL_SCORE].idxmax(), "rank"]
-            if pd.notna(rk):
-                pire = f"#{int(rk)}"
+        pire = _fmt4(sub[COL_SCORE].max()) if len(sub) else "—"
         couv = (f"{100 * table['couvert'].mean():.1f} %" if len(table) else "n/a")
         cartes = [("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
                   ("Part du score global", f"{100 * part:.1f} %", "#ad1457"),
@@ -619,7 +676,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             f"<br>Predit : {_fmt(r['y_pred'])}"
             f"<br>Intervalle : [{_fmt(r['lo'])} ; {_fmt(r['hi'])}]"
             f"<br>Score cumule : {_fmt4(r['score'])}"
-            f"<br>Anomalies regroupees : {int(r['n'])}"
+            f"<br>Anomalies : {int(r['n'])} sur {int(r['n_lignes'])} lignes"
             for _, r in g.iterrows()]
         montants = g["y_obs"].tolist()
         with fw_barres.batch_update():
@@ -706,8 +763,6 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
             _vider(fw_evol, "Aucun historique pour ce sous-portefeuille.")
             return
         val = hist[target].to_numpy(dtype="float64")
-        #  Le trimestre valide est le dernier de l'historique quand `expl` ne
-        #  porte pas d'annee/trimestre exploitable.
         p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
         xb = yb = xp = yp = xh = yh = []
         if ctx:
@@ -828,7 +883,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
 
         #  La table agregee est calculee UNE fois et partagee par le forest
         #  plot, les barres, le tableau et le contexte de la courbe.
-        table = socle.table_axes(sub, sub_ex, axes)
+        table = socle.table_axes(sub_ex, axes)
         etat["table"] = table
 
         _maj_cercle(sub, titre)
@@ -942,7 +997,7 @@ def tableau_de_bord_unifie(anomalies_prio, expl, df, id_cols=None, target=None,
 # =============================================================================
 #  4. EXECUTION AUTOMATIQUE
 # =============================================================================
-_PREREQUIS = ["anomalies_prio", "expl", "df", "ID_COLS", "TARGET"]
+_PREREQUIS = ["df", "ID_COLS", "TARGET"]
 _trouve = {n: _session(n) for n in _PREREQUIS}
 _manquants = [n for n, (ok, _) in _trouve.items() if not ok]
 
@@ -956,5 +1011,5 @@ if _manquants:
           "celle-ci.")
 else:
     controles = tableau_de_bord_unifie(
-        _trouve["anomalies_prio"][1], _trouve["expl"][1], _trouve["df"][1],
-        id_cols=_trouve["ID_COLS"][1], target=_trouve["TARGET"][1])
+        _trouve["df"][1], id_cols=_trouve["ID_COLS"][1],
+        target=_trouve["TARGET"][1])
