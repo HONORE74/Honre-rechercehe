@@ -1,5 +1,25 @@
 Bloc 0
 
+
+# Avant (manque le nom)
+resultats = metriques(y_true_final, y_pred_final)
+
+# Après
+resultats = metriques(f"{TARGET_MODE}_{FEATURE_MODE}", y_true_final, y_pred_final)
+
+
+
+
+
+# Avant
+mae_test_val = float(metriques(y_true_final, y_pred_final)['MAE'])
+
+# Après
+mae_test_val = float(metriques("test", y_true_final, y_pred_final)['MAE'])
+
+
+
+
 # ── Switchs de configuration ──────────────────────────────────────────
 TARGET_MODE  = "cumul"   # "cumul" ou "dec"
 FEATURE_MODE = "C"       # "A", "B" ou "C"
