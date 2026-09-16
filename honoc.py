@@ -1,12 +1,18 @@
-# y_pred_final_avant = tes prédictions reconstruites du modèle AVANT tuning
-# (même logique de reconstruction "si dec" que pour y_pred_final, mais avec modele_avant / pred_avant["Test"])
-# Si TARGET_MODE == "cumul", c'est simplement pred_avant["Test"]
+# Si TARGET_MODE == "cumul" (ton mode actuel), c'est simplement :
+y_pred_final_avant = pred_avant["Test"]
+
+# Si jamais tu es en TARGET_MODE == "dec", il faudrait la même reconstruction
+# que pour y_pred_final mais à partir de modele_avant — dis-le-moi si c'est le cas.
 
 comparaison_residus = pd.DataFrame({
-    "y_vrai": np.asarray(y_true_final),
+    "y_vrai": y_true_final,
     "erreur_avant": np.abs(np.asarray(y_pred_final_avant) - np.asarray(y_true_final)),
     "erreur_apres": np.abs(np.asarray(y_pred_final)       - np.asarray(y_true_final)),
 })
+comparaison_residus = pd.concat(
+    [df_test.loc[idx_test, COLS_ID].reset_index(drop=True), comparaison_residus.reset_index(drop=True)],
+    axis=1,
+)
 comparaison_residus["delta"] = comparaison_residus["erreur_apres"] - comparaison_residus["erreur_avant"]
 
 pct_degrade  = (comparaison_residus["delta"] > 0).mean() * 100
