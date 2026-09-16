@@ -1,9 +1,15 @@
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+# Avant
+modele.entrainer(
+    df_train[FEATURES_MODEL], df_train[MODEL_TARGET],
+    df_valid[FEATURES_MODEL], df_valid[MODEL_TARGET]
+)
 
-
-
+# Après
+modele.fit(
+    df_train[FEATURES_MODEL], df_train[MODEL_TARGET],
+    eval_set=[(df_valid[FEATURES_MODEL], df_valid[MODEL_TARGET])],
+    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)]
+)
 
 
 
