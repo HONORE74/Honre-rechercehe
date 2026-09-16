@@ -1,37 +1,40 @@
-resultats_comparaison = []
+# Code validate
 
-for t_mode in ["cumul", "dec"]:
-    for f_mode in ["A", "B", "C"]:
-        TARGET_MODE = t_mode
-        FEATURE_MODE = f_mode
+# 0. Correspondance colonne -> nombre de lags (2 groupes désormais : target et vars_expliques)
+lags_par_colonne = {
+    TARGET: N_LAGS_TARGET,
+    'dec_' + TARGET: N_LAGS_TARGET,
+    **{v: N_LAGS_VARS for v in vars_expliques},
+}
 
-        # -- (garde ta reconstruction existante de FEATURES_MODEL, MODEL_TARGET,
-        #     X_tr, y_tr, X_va, y_va, X_te, y_te, inchangée)
+# 2. Check columns exist
+expected_cols = [f'{c}_lag_{i}' for c, n in lags_par_colonne.items() for i in range(1, n + 1)]
+assert all(c in df_with_lag.columns for c in expected_cols), "Missing lag columns"
+print("✅ All lag columns present")
 
-        modele_combo = lgb.LGBMRegressor(
-            objective=OBJECTIVE,
-            metric=METRIC,
-            n_estimators=4000,
-            learning_rate=0.02,
-            num_leaves=40,
-            max_depth=8,
-            min_child_samples=100,
-            subsample=0.9,
-            subsample_freq=1,
-            colsample_bytree=0.85,
-            reg_alpha=0.5,
-            reg_lambda=1.0,
-            **LGBM_DETERMINISM,   # random_state=SEED, n_jobs=4, deterministic=True, force_row_wise=True
-            verbose=-1,
-        )
-        modele_combo.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
-            callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False), lgb.log_evaluation(0)],
-        )
+# 3. Verify lag logic & Display Examples
+sort_cols = id_vars + [year_col, time_col]
+df_sorted = df_with_lag.sort_values(sort_cols).reset_index(drop=True)
 
-        pred_test = modele_combo.predict(X_te)
-        idx_test = X_te.index
+first_id_row = df_sorted[id_vars].sample(n=1, random_state=SEED).iloc[0]
+mask = (df_sorted[id_vars] == first_id_row).all(axis=1)
+g = df_sorted[mask].reset_index(drop=True)
 
-        # -- (garde ta logique de reconstruction "si dec" et le calcul des métriques inchangés,
-        #     juste remplacer modele.predict(...) par modele_combo.predict(...) partout)
+display_cols = id_vars + [year_col, time_col] + list(lags_par_colonne.keys()) + expected_cols
+print("Example Rows (First Group):")
+display(g[display_cols].sort_values([year_col, time_col], ascending=False))
+
+# Automated check for sample group on all lagged columns
+for col, n in lags_par_colonne.items():
+    for i in range(len(g)):
+        for lag in range(1, n + 1):
+            lc = f'{col}_lag_{lag}'
+            val = g[lc].iloc[i]
+            exp = g[col].iloc[i - lag] if i - lag >= 0 else np.nan
+            assert (pd.isna(val) and pd.isna(exp)) or (val == exp), f"Lag mismatch at row {i}, lag {lag}"
+    print(f"✅ Lag values correct for first group for col : {col}")
+
+# 4. Check NaNs in first row of each group
+first_rows_idx = df_sorted.groupby(id_vars, observed=False).apply(lambda x: x.index[0], include_groups=False)
+assert df_sorted.loc[first_rows_idx, expected_cols].isna().all().all(), "First rows of groups should have NaN lags"
+print("✅ NaNs correct in first row of each group")
