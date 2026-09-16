@@ -502,3 +502,25 @@ predictions = paquet.predict(X_nouveau)
 
 
 
+
+
+Voci la parie CQR et tous 
+
+
+
+# Actuellement (bug)
+return np.clip(p, 0, None)
+
+# Correct
+return p if CLIP_MIN is None else np.clip(p, CLIP_MIN, None)
+
+
+
+
+
+
+predict_test = paquet.predict(paquet.X_test)
+
+
+
+
