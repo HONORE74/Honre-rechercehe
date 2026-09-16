@@ -43,3 +43,30 @@ elif TARGET_MODE == "dec":
 
 cols_lag_target = [TARGET, "dec_" + TARGET] if TARGET_MODE == "cumul" else ["dec_" + TARGET]
 lags_target = [f"{col}_lag_{i}" for col in cols_lag_target for i in range(1, N_LAGS_TARGET + 1)]
+
+
+
+
+
+
+
+
+
+import os
+import random
+import numpy as np
+
+SEED = 42
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+# Paramètres LightGBM à ajouter systématiquement (baseline, tuning, comparaison)
+# pour éliminer le non-déterminisme lié au multi-threading
+LGBM_DETERMINISM = dict(
+    random_state=SEED,
+    deterministic=True,      # force un calcul reproductible des histogrammes
+    force_row_wise=True,     # nécessaire pour que deterministic=True soit effectif
+    n_jobs=4,                # NE PAS laisser -1 : le nombre de threads doit être fixe
+)
