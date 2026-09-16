@@ -1,21 +1,27 @@
 Bloc 0
 
-
-# Avant (manque le nom)
-resultats = metriques(y_true_final, y_pred_final)
-
-# Après
-resultats = metriques(f"{TARGET_MODE}_{FEATURE_MODE}", y_true_final, y_pred_final)
-
-
-
-
-
 # Avant
-mae_test_val = float(metriques(y_true_final, y_pred_final)['MAE'])
+modele.entrainer(X_tr, y_tr, X_va, y_va)
 
 # Après
-mae_test_val = float(metriques("test", y_true_final, y_pred_final)['MAE'])
+modele.fit(
+    X_tr, y_tr,
+    eval_set=[(X_va, y_va)],
+    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)]
+)
+
+
+
+
+
+
+
+res = metriques(f"{t_mode}_{f_mode}", y_true_final, y_pred_final)
+
+
+
+
+
 
 
 
