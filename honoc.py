@@ -524,3 +524,87 @@ predict_test = paquet.predict(paquet.X_test)
 
 
 
+
+
+import joblib, numpy as np, pandas as pd
+from pathlib import Path
+from datetime import datetime
+import lightgbm as lgb
+
+class ModeleRBNS:
+    def __init__(self, modele, features, categorielles, categories, params,
+                 clip_min=None, metriques_test=None,
+                 X_test=None, y_test=None, infos_test=None):
+        self.modele        = modele
+        self.features      = list(features)
+        self.categorielles = list(categorielles)
+        self.categories    = categories
+        self.params        = params
+        self.clip_min      = clip_min          # stocké dans le paquet
+        self.metriques_test = metriques_test
+        self.date          = datetime.now().isoformat(timespec="seconds")
+        self.X_test        = X_test
+        self.y_test        = y_test
+        self.infos_test    = infos_test
+
+    def _preparer(self, X):
+        manq = [c for c in self.features if c not in X.columns]
+        if manq: raise KeyError(f"Colonnes absentes : {manq}")
+        Xp = X[self.features].copy()
+        for c in self.categorielles:
+            Xp[c] = pd.Categorical(Xp[c].astype(str), categories=self.categories[c])
+        return Xp
+
+    def predict(self, X):
+        p = self.modele.predict(self._preparer(X))
+        return p if self.clip_min is None else np.clip(p, self.clip_min, None)
+
+    def fit(self, X, y, **kw):
+        self.modele = lgb.LGBMRegressor(**self.params)
+        self.modele.fit(self._preparer(X), y, **kw)
+        self.date = datetime.now().isoformat(timespec="seconds")
+        return self
+
+    def importance(self, n=20):
+        v = pd.Series(self.modele.booster_.feature_importance("gain"),
+                      index=self.modele.feature_name_)
+        return (100*v/v.sum()).sort_values(ascending=False).head(n)
+
+    def sauver(self, chemin):
+        joblib.dump(self, chemin)
+        return chemin
+
+    @staticmethod
+    def charger(chemin):
+        return joblib.load(chemin)
+
+    def __repr__(self):
+        mae_str = "n/a"
+        if self.metriques_test and 'MAE' in self.metriques_test:
+            mae_val = self.metriques_test['MAE']
+            mae_str = f"{mae_val:,.0f}" if isinstance(mae_val, (int, float)) \
+                      else str(mae_val)
+        return f"<ModeleRBNS | {len(self.features)} variables | " \
+               f"MAE test {mae_str} | {self.date}>"
+
+
+
+
+
+
+
+
+
+# AVANT
+mae_test_val = float(metriques("Test", y_te, pred_apres["Test"])['MAE'])
+# APRÈS
+mae_test_val = float(metriques(y_true_final, y_pred_final)['MAE'])
+
+# AVANT
+paquet = ModeleRBNS(modele=modele_apres, features=list(X_tr.columns), ...
+# APRÈS
+paquet = ModeleRBNS(modele=modele_apres, features=list(FEATURES_MODEL),
+                    clip_min=CLIP_MIN, ...
+
+
+
