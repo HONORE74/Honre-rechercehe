@@ -1,48 +1,72 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# TABLEAU DE BORD UNIFIE - anomalies, evolution, priorisation
-# VERSION DASH (remplace ipywidgets)
-# Affichage inline dans Jupyter / VSCode sur Domino (JupyterDash)
+#  TABLEAU DE BORD UNIFIE - anomalies, evolution, priorisation
 #
-# Memes regles que l'original :
-# 1. SEULES LES ANOMALIES SONT AFFICHEES (score_composite != 0)
-# 2. AUCUNE SOMMATION — valeurs brutes de la ligne
+#  UN SEUL BLOC, UNE SEULE BASE. Il suffit d'avoir en session :
+#      df, ID_COLS, TARGET            (ALPHA facultatif)
+#
+#  DEUX REGLES QUI COMMANDENT TOUT LE FICHIER
+#  -------------------------------------------
+#  1. SEULES LES ANOMALIES SONT AFFICHEES. Une ligne entre dans le tableau de
+#     bord si et seulement si son score_composite est different de zero. Les
+#     situations normales ne polluent ni les graphiques ni les montants.
+#  2. AUCUNE SOMMATION. La valeur observee, la prediction et les bornes
+#     conformes affichees sont celles de la LIGNE, telles qu'elles sont dans
+#     df. Rien n'est agrege, donc rien ne peut etre fausse par un cumul.
+#
+#  CE QUE FONT LES AXES
+#  --------------------
+#  Les axes commandent deux choses, et deux seulement : la profondeur du
+#  cercle, et la composition des libelles. Ils ne modifient AUCUN montant.
+#  C'est le changement par rapport a la version precedente, qui les faisait
+#  sommer les montants et melangeait de ce fait les lignes saines aux
+#  anomalies.
+#
+#  D'OU VIENT CHAQUE CHOSE
+#  ------------------------
+#    periode validee  = les lignes de df qui portent une prediction conforme,
+#                       c'est-a-dire dont borne_basse, borne_haute et y_pred
+#                       sont renseignees. Si plusieurs trimestres en portent,
+#                       le plus recent est retenu et le code le dit.
+#    anomalies        = ces lignes-la, filtrees sur score_composite != 0
+#    historique       = df en entier, filtre sur la cle COMPLETE du
+#                       sous-portefeuille, tous trimestres disponibles
+#
+#  SI LA COURBE D'EVOLUTION N'AFFICHE QU'UN POINT
+#  -----------------------------------------------
+#  C'est que df ne contient qu'un seul trimestre pour ce sous-portefeuille.
+#  Une trace a un point n'affiche qu'un marqueur, jamais de ligne. Le titre du
+#  panneau le dit explicitement, et le resume de demarrage indique combien de
+#  trimestres df contient reellement.
 # =============================================================================
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from pathlib import Path
-
-# --- Dash : prefer JupyterDash pour l'affichage inline dans Jupyter/VSCode ---
-try:
-    from jupyter_dash import JupyterDash as _DashClass
-    _MODE_JUPYTER = True
-except ImportError:
-    from dash import Dash as _DashClass
-    _MODE_JUPYTER = False
-
-from dash import dcc, html, Input, Output, State, callback_context, dash_table, no_update
-import dash_bootstrap_components as dbc
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
 
 # ┌──────────────────────────── PARAMETRES ────────────────────────────┐
-TOP_N_PANNEAUX  = 12
-N_TRIMESTRES    = 10
-N_UNITES_LISTE  = 30
-N_LIGNES_TABLE  = 15
-N_VARS_EXPLIC   = 5
-COL_SCORE       = "score_composite"
-COL_OBS         = "y_obs"
-COL_PRED        = "y_pred"
+TOP_N_PANNEAUX = 12       # barres et forest plot
+N_TRIMESTRES   = 10       # historique affiche
+N_UNITES_LISTE = 30       # unites proposees dans le selecteur
+N_LIGNES_TABLE = 15       # lignes du tableau du bas
+N_VARS_EXPLIC  = 5        # variables explicatives sous la courbe
+COL_SCORE      = "score_composite"
+COL_OBS        = "y_obs"          # a defaut, la cible elle-meme est utilisee
+COL_PRED       = "y_pred"
 COL_LO, COL_HI = "borne_basse", "borne_haute"
-PERIODE_VALIDEE = "auto"
-ECHELLE         = "Bluered"
-VUE_GENERALE    = ""
+PERIODE_VALIDEE = "auto"  # "auto" ou un couple explicite, ex. (2024, 4)
+ECHELLE        = "Bluered"
+VUE_GENERALE   = ""
 # └─────────────────────────────────────────────────────────────────────┘
 
+#  Separateur interne des identifiants. U+001F ne peut pas apparaitre dans un
+#  libelle metier, contrairement a "/".
 SEP = "\x1f"
 
+#  Colonnes de resultat, jamais candidates comme variable explicative.
 _EXCLURE_VARS = {"time_idx", "year", "quarter", "y_obs", "y_pred",
                  "borne_basse", "borne_haute", "dans_intervalle", "largeur",
                  "score_composite", "rank", "ecart_intervalle", "severite",
@@ -55,6 +79,7 @@ _VIDE = "rgba(0,0,0,0)"
 
 
 def _fmt(v):
+    """Format francais des milliers : 1249441.0 -> '1 249 441'."""
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
     return f"{v:,.0f}".replace(",", " ")
@@ -64,6 +89,23 @@ def _fmt4(v):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
     return f"{v:,.4g}".replace(",", " ")
+
+
+def _session(nom):
+    """Retrouve une variable de la session Jupyter, pas seulement du module."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is not None and nom in ip.user_ns:
+            return True, ip.user_ns[nom]
+    except Exception:
+        pass
+    if nom in globals():
+        return True, globals()[nom]
+    import __main__
+    if hasattr(__main__, nom):
+        return True, getattr(__main__, nom)
+    return False, None
 
 
 def _mise_en_forme(fig, hauteur, marges=None):
@@ -77,75 +119,130 @@ def _mise_en_forme(fig, hauteur, marges=None):
     return fig
 
 
+def _bandeau(txt, fond="#eceff1", coul="#37474f"):
+    """Bandeau HTML. Prend UNE CHAINE, jamais le retour d'un display()."""
+    return HTML(f"<div style='font-family:system-ui,sans-serif;font-size:12.5px;"
+                f"color:{coul};background:{fond};padding:9px 13px;"
+                f"border-radius:6px;margin:14px 0 8px 0'>{txt}</div>")
+
+
 # =============================================================================
-# SOCLE — identique a l'original, zero modification
+#  1. SOCLE DE DONNEES - anomalies seules, valeurs brutes
 # =============================================================================
 class _Socle:
+    """Prepare une fois ce que les mises a jour reliront des dizaines de fois."""
 
     def __init__(self, df, id_cols, target, alpha, verbeux=True):
         self.df, self.target, self.alpha = df, target, alpha
         self.cles = [c for c in id_cols if c in df.columns]
         if not self.cles:
-            raise ValueError(f"Aucune colonne de ID_COLS n'est dans df : {list(id_cols)}")
+            raise ValueError(f"Aucune colonne de ID_COLS n'est dans df : "
+                             f"{list(id_cols)}")
         if target not in df.columns:
             raise ValueError(f"TARGET '{target}' absent de df.")
         if COL_SCORE not in df.columns:
             raise ValueError(f"Colonne de score '{COL_SCORE}' absente de df.")
 
+        #  --- la periode validee : les lignes qui portent une prediction ---
+        #  Marqueur tire de la donnee, pas d'une convention comme "le dernier
+        #  trimestre" : une ligne appartient a la periode validee si et
+        #  seulement si elle porte un intervalle conforme.
         cp = [c for c in (COL_LO, COL_HI, COL_PRED) if c in df.columns]
         if not cp:
-            raise ValueError(f"df ne contient aucune des colonnes {COL_LO}, {COL_HI}, {COL_PRED}.")
+            raise ValueError(
+                f"df ne contient aucune des colonnes {COL_LO}, {COL_HI}, "
+                f"{COL_PRED} : impossible d'identifier la periode validee.")
         porte_cp = df[cp].notna().all(axis=1)
         if not porte_cp.any():
-            raise ValueError(f"Aucune ligne de df ne porte de prediction conforme.")
+            raise ValueError("Aucune ligne de df ne porte de prediction "
+                             f"conforme ({cp} tous renseignes).")
 
         valide = df[porte_cp]
         self.periode = None
         if {"year", "quarter"} <= set(df.columns):
-            couples = sorted(set(zip(valide["year"].astype(int), valide["quarter"].astype(int))))
-            self.periode = (tuple(PERIODE_VALIDEE) if PERIODE_VALIDEE != "auto" else couples[-1])
+            couples = sorted(set(zip(valide["year"].astype(int),
+                                     valide["quarter"].astype(int))))
+            self.periode = (tuple(PERIODE_VALIDEE)
+                            if PERIODE_VALIDEE != "auto" else couples[-1])
             if len(couples) > 1 and verbeux:
-                print(f"Note : {len(couples)} trimestres portent une prediction. "
-                      f"Le plus recent est retenu ({self.periode[0]}-T{self.periode[1]}).")
+                print(f"Note : {len(couples)} trimestres portent une "
+                      f"prediction. Le plus recent est retenu "
+                      f"({self.periode[0]}-T{self.periode[1]}).")
             valide = valide[(valide["year"].astype(int) == self.periode[0])
                             & (valide["quarter"].astype(int) == self.periode[1])]
 
+        #  --- REGLE 1 : seules les anomalies entrent dans le tableau de bord ---
         score = pd.to_numeric(valide[COL_SCORE], errors="coerce").fillna(0)
         self.ano = valide[score != 0].copy()
         self.ano[COL_SCORE] = score[score != 0].values
         if not len(self.ano):
-            raise ValueError(f"Aucune anomalie : toutes les lignes ont un {COL_SCORE} nul.")
+            raise ValueError(
+                f"Aucune anomalie : toutes les lignes de la periode validee "
+                f"ont un {COL_SCORE} nul.")
 
+        #  y_obs : la colonne dediee si elle existe, sinon la cible elle-meme.
         if COL_OBS not in self.ano.columns:
             self.ano[COL_OBS] = self.ano[target].values
 
         for c in self.cles:
             self.ano[c] = self.ano[c].astype(str)
-        self.ano = self.ano.sort_values(COL_SCORE, ascending=False).reset_index(drop=True)
+        self.ano = self.ano.sort_values(COL_SCORE, ascending=False) \
+                           .reset_index(drop=True)
         self.ano["rang"] = np.arange(1, len(self.ano) + 1)
         self.score_global = float(self.ano[COL_SCORE].sum()) or 1.0
+
+        #  Cles textuelles de df, par axe. Construites une fois : sans elles,
+        #  chaque changement de selection relirait df en entier.
         self._df_txt = {c: df[c].astype(str).values for c in self.cles}
-        self.vars_explic = [c for c in df.columns
-                            if c != target and c not in _EXCLURE_VARS
-                            and pd.api.types.is_numeric_dtype(df[c])]
+
+        #  Variables explicatives candidates : numeriques, hors cible et hors
+        #  colonnes de resultat.
+        self.vars_explic = [
+            c for c in df.columns
+            if c != target and c not in _EXCLURE_VARS
+            and pd.api.types.is_numeric_dtype(df[c])]
+
+        #  Profondeur d'historique reellement disponible : c'est elle qui
+        #  determine si une courbe peut etre tracee.
         self.trimestres = []
         if {"year", "quarter"} <= set(df.columns):
-            self.trimestres = sorted(set(zip(df["year"].astype(int), df["quarter"].astype(int))))
+            self.trimestres = sorted(set(zip(df["year"].astype(int),
+                                             df["quarter"].astype(int))))
 
         if verbeux:
-            per_txt = f"{self.periode[0]}-T{self.periode[1]}" if self.periode else "non datee"
+            per_txt = (f"{self.periode[0]}-T{self.periode[1]}"
+                       if self.periode else "non datee")
             print("=" * 74)
-            print(f"SOURCE : df   ·   {len(df):,} lignes".replace(",", " "))
+            print(f"SOURCE UNIQUE : df   ·   {len(df):,} lignes".replace(",", " "))
             print("=" * 74)
             if self.trimestres:
                 t0, t1 = self.trimestres[0], self.trimestres[-1]
-                print(f"   trimestres : {t0[0]}-T{t0[1]} -> {t1[0]}-T{t1[1]}   ({len(self.trimestres)} au total)")
-            print(f"   periode validee    : {per_txt}   ({int(porte_cp.sum()):,} lignes)".replace(",", " "))
-            print(f"   anomalies retenues : {len(self.ano):,} ({COL_SCORE} != 0)".replace(",", " "))
+                print(f"   trimestres dans df : {t0[0]}-T{t0[1]} -> "
+                      f"{t1[0]}-T{t1[1]}   ({len(self.trimestres)} au total)")
+                if len(self.trimestres) < 2:
+                    print("      ATTENTION : un seul trimestre dans df. La "
+                          "courbe d'evolution ne pourra")
+                    print("      afficher qu'un point, sans ligne : il n'y a "
+                          "rien a relier.")
+                elif len(self.trimestres) < 3:
+                    print("      NOTE : deux trimestres seulement. Le classement "
+                          "des variables")
+                    print("      explicatives demande au moins trois points et "
+                          "sera indisponible.")
+            print(f"   periode validee    : {per_txt}   "
+                  f"({int(porte_cp.sum()):,} lignes avec prediction)"
+                  .replace(",", " "))
+            print(f"   anomalies retenues : {len(self.ano):,} "
+                  f"({COL_SCORE} != 0)".replace(",", " "))
             print(f"   axes disponibles   : {', '.join(self.cles)}")
+            print(f"   variables suivies  : {len(self.vars_explic)}")
             print("=" * 74)
 
+    # ------------------------------------------------------------ filtrage
     def filtrer(self, colonne, valeur):
+        """Filtre les anomalies. Se replie sur la vue generale si la valeur ne
+        correspond pas a la colonne : c'est l'etat transitoire d'un changement
+        de maille, et filtrer dessus viderait tous les panneaux."""
         if not colonne or colonne not in self.ano.columns:
             return self.ano, "vue generale"
         if not valeur:
@@ -155,32 +252,40 @@ class _Socle:
             return self.ano, f"{colonne} — vue generale"
         return self.ano[m], f"{colonne} = {valeur}"
 
+    # ================================================================
+    #  REGLE 2 : aucune sommation. Une ligne reste une ligne.
+    # ================================================================
     def preparer(self, sub, axes):
+        """Ajoute seulement un libelle lisible, tire des axes actifs.
+
+        Aucun groupby, aucune somme : y_obs, y_pred, borne_basse et
+        borne_haute restent les valeurs de la ligne, telles qu'elles sont dans
+        df. Les axes ne servent ici qu'a composer le libelle affiche.
+        """
         axes = [a for a in axes if a in sub.columns] or self.cles[:1]
         if not len(sub):
             return sub.assign(libelle=pd.Series(dtype=str))
         t = sub.copy()
-        if len(axes) == 1:
-            t["libelle"] = t[axes[0]].astype(str).str.slice(0, 38)
-        else:
-            t["libelle"] = t[axes].apply(
-                lambda row: " | ".join(row.astype(str)), axis=1
-            ).str.slice(0, 38)
-        t["libelle_rang"] = "#" + t["rang"].astype(str) + "  " + t["libelle"]
+        t["libelle"] = t[axes].astype(str).agg(" | ".join, axis=1).str.slice(0, 38)
+        #  Le rang prefixe garantit un libelle unique meme si deux anomalies
+        #  ne different que par un axe desactive.
+        t["libelle_rang"] = ("#" + t["rang"].astype(str) + "  " + t["libelle"])
         return t
 
+    # ------------------------------------------------------------ unites
     def unites(self, sub, axes, n=N_UNITES_LISTE):
+        """Une entree par ANOMALIE, identifiee par sa cle complete."""
         if not len(sub):
             return []
         t = self.preparer(sub.head(n), axes)
-        return [{"label": f"{r['libelle_rang']}   ({_fmt(r[COL_OBS])})",
-                 "value": SEP.join(str(r[c]) for c in self.cles)}
+        return [(f"{r['libelle_rang']}   ({_fmt(r[COL_OBS])})",
+                 tuple(str(r[c]) for c in self.cles))
                 for _, r in t.iterrows()]
 
-    def ligne(self, sub, cle_str):
-        if not len(sub) or cle_str is None:
+    def ligne(self, sub, cle):
+        """Retrouve l'anomalie exacte a partir de sa cle complete."""
+        if not len(sub) or cle is None:
             return None
-        cle = cle_str.split(SEP)
         m = np.ones(len(sub), dtype=bool)
         for c, v in zip(self.cles, cle):
             m &= (sub[c].astype(str).values == str(v))
@@ -188,36 +293,55 @@ class _Socle:
         return None if not len(t) else t.iloc[0]
 
     def contexte(self, r):
+        """Valeurs BRUTES de la ligne : rien n'est somme ni recalcule."""
         if r is None:
             return None
-        per = f"{self.periode[0]}-T{self.periode[1]}" if self.periode else None
+        per = (f"{self.periode[0]}-T{self.periode[1]}" if self.periode else None)
         obs, lo, hi = float(r[COL_OBS]), float(r[COL_LO]), float(r[COL_HI])
         return dict(per=per, pred=float(r[COL_PRED]), lo=lo, hi=hi, obs=obs,
                     couvert=bool(lo <= obs <= hi), score=float(r[COL_SCORE]),
                     rang=int(r["rang"]))
 
+    # ------------------------------------------------- masques par axes
     def _masque(self, textes, cles, valeurs):
         m = np.ones(len(next(iter(textes.values()))), dtype=bool)
         for a, v in zip(cles, valeurs):
             m &= (textes[a] == str(v))
         return m
 
-    def historique(self, cle_str, n=N_TRIMESTRES):
-        cle = cle_str.split(SEP)
+    # -------------------------------------------------------- historique
+    def historique(self, cle, n=N_TRIMESTRES):
+        """Historique du sous-portefeuille, sur sa CLE COMPLETE.
+
+        Aucune agregation entre sous-portefeuilles : on suit exactement la
+        ligne selectionnee a travers le temps.
+        """
         d = self.df[self._masque(self._df_txt, self.cles, cle)]
         if not len(d):
             return None, []
         colonnes = [self.target] + [v for v in self.vars_explic if v in d.columns]
         if {"year", "quarter"} <= set(d.columns):
-            g = (d.groupby(["year", "quarter"], observed=True)[colonnes]
-                 .sum().reset_index()
-                 .sort_values(["year", "quarter"]).tail(n))
+            #  Le groupby ne sert qu'a dedoublonner si df contenait plusieurs
+            #  lignes pour un meme trimestre ; avec la cle complete il n'y en a
+            #  normalement qu'une, la somme est alors l'identite.
+            g = d.groupby(["year", "quarter"], observed=True)[colonnes] \
+                 .sum().reset_index().sort_values(["year", "quarter"]).tail(n)
             per = (g["year"].astype(int).astype(str) + "-T"
                    + g["quarter"].astype(int).astype(str)).tolist()
             return g, per
-        return d[colonnes].tail(n).reset_index(drop=True), [str(i) for i in range(min(n, len(d)))]
+        return d[colonnes].tail(n).reset_index(drop=True), \
+            [str(i) for i in range(min(n, len(d)))]
 
+    # ------------------------------------ variables explicatives, notees
     def variables_explicatives(self, hist, n=N_VARS_EXPLIC):
+        """Les n variables dont la RUPTURE au dernier trimestre est la plus
+        forte, mesuree contre leur propre passe.
+
+        Critere : (valeur du trimestre valide − mediane des trimestres
+        precedents) rapportee a l'ecart inter-quartile de ces memes trimestres.
+        Une variable stable qui saute remonte en tete ; une variable
+        naturellement volatile ne remonte que si elle sort de son regime.
+        """
         vide = pd.DataFrame(columns=["variable", "valeur", "z"])
         if hist is None or len(hist) < 3:
             return vide
@@ -231,6 +355,8 @@ class _Socle:
             passe, courant = vals[:-1], vals[-1]
             med = float(np.median(passe))
             q1, q3 = np.percentile(passe, [25, 75])
+            #  Plancher de dispersion : sans lui, une variable strictement
+            #  constante donnerait une division par zero et un z infini.
             dispersion = max(float(q3 - q1), abs(med) * .01, 1e-9)
             z = (courant - med) / dispersion
             if not np.isfinite(z) or z == 0:
@@ -239,21 +365,26 @@ class _Socle:
         if not lignes:
             return vide
         t = pd.DataFrame(lignes)
-        return t.reindex(t["z"].abs().sort_values(ascending=False).index).head(n).reset_index(drop=True)
+        return t.reindex(t["z"].abs().sort_values(ascending=False).index) \
+                .head(n).reset_index(drop=True)
 
+    # ------------------------------------------------------- hierarchie
     def hierarchie(self, sub, chemin):
+        """Noeuds du cercle. Ici l'agregation porte sur le SCORE, pas sur des
+        montants : cumuler des scores de gravite est licite, c'est le propos
+        meme du cercle. Les montants, eux, ne sont jamais sommes."""
         if not len(sub) or not chemin:
             return pd.DataFrame()
         prof_max = len(chemin)
-        agg_spec = {"score_total": (COL_SCORE, "sum"),
-                    "score_moyen": (COL_SCORE, "mean"),
-                    "score_max":   (COL_SCORE, "max"),
-                    "n":           (COL_SCORE, "size")}
+        agg = {"score_total": (COL_SCORE, "sum"),
+               "score_moyen": (COL_SCORE, "mean"),
+               "score_max": (COL_SCORE, "max"), "n": (COL_SCORE, "size")}
         total = float(sub[COL_SCORE].sum()) or 1.0
+
         lignes = []
         for prof in range(1, prof_max + 1):
             cols = chemin[:prof]
-            g = sub.groupby(cols, observed=True).agg(**agg_spec).reset_index()
+            g = sub.groupby(cols, observed=True).agg(**agg).reset_index()
             for _, r in g.iterrows():
                 vals = [str(r[c]) for c in cols]
                 st = float(r["score_total"])
@@ -265,526 +396,615 @@ class _Socle:
                     "profondeur": prof, "score_total": st,
                     "valeur_secteur": st if prof == prof_max else 0.0,
                     "score_moyen": float(r["score_moyen"]),
-                    "score_max":   float(r["score_max"]),
-                    "n": int(r["n"]),
+                    "score_max": float(r["score_max"]), "n": int(r["n"]),
                     "part": 100 * st / total})
         return pd.DataFrame(lignes)
 
-    def options_valeurs(self, colonne):
-        g = (self.ano.groupby(colonne, observed=True)[COL_SCORE]
-             .agg(["size", "sum"]).reset_index()
-             .sort_values("sum", ascending=False))
-        return [{"label": "— vue generale —", "value": VUE_GENERALE}] + [
-            {"label": f"{r[colonne]}   ({int(r['size'])} anomalies)",
-             "value": str(r[colonne])}
-            for _, r in g.iterrows()]
-
 
 # =============================================================================
-# FIGURES — meme logique que l'original, retournent go.Figure
+#  2. CREATION DES FIGURES (structure figee, seules les donnees changent)
 # =============================================================================
-
-def _fig_vide(message, hauteur=260):
-    fig = go.Figure()
-    fig.update_layout(
-        title=dict(text=message, font=dict(size=14), x=0.015, xanchor="left"),
-        height=hauteur, template="plotly_white",
-        paper_bgcolor="white", plot_bgcolor="white")
-    return fig
-
-
-def _fig_cercle(socle, sub, titre, axes):
-    h = socle.hierarchie(sub, axes)
-    if not len(h):
-        return _fig_vide("Aucune anomalie a representer.", 300)
-    cmax = float(np.nanpercentile(h["score_moyen"], 95))
-    if not np.isfinite(cmax) or cmax <= 0:
-        cmax = float(h["score_moyen"].max()) or 1.0
-    survol = [
-        f"<b>{r['label']}</b><br>"
-        f"Gravite moyenne : {_fmt4(r['score_moyen'])}<br>"
-        f"Anomalies : {int(r['n'])}<br>"
-        f"Score cumule : {_fmt4(r['score_total'])} ({r['part']:.1f} %)<br>"
-        f"Pire anomalie : {_fmt4(r['score_max'])}"
-        for _, r in h.iterrows()]
-    fig = go.Figure(go.Sunburst(
-        ids=h["id"].tolist(), labels=h["label"].tolist(),
-        parents=h["parent"].tolist(), values=h["valeur_secteur"].tolist(),
-        branchvalues="remainder",
-        text=[f"{p:.0f} %" for p in h["part"]],
-        texttemplate="%{label}<br>%{text}",
-        hovertext=survol, hoverinfo="text",
-        insidetextorientation="radial",
-        maxdepth=len(axes),
-        marker=dict(
-            colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
-            cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
-            colorbar=dict(title="Gravite<br>moyenne", thickness=16, len=.7, tickformat="~s")),
-    ))
+def _creer_cercle():
+    fig = go.Figure(go.Sunburst(ids=[], labels=[], parents=[], values=[],
+                                branchvalues="remainder"))
     _mise_en_forme(fig, 620, dict(l=10, r=10, t=100, b=15))
-    fig.update_layout(title=dict(
-        text=f"Repartition des anomalies  ·  {' › '.join(axes)}<br><sup>{titre}</sup>",
-        font=dict(size=15), x=.015, xanchor="left"))
-    return fig
+    return go.FigureWidget(fig)
 
 
-def _fig_barres(socle, sub, titre, target, axes, top_n=TOP_N_PANNEAUX):
-    if not len(sub):
-        return _fig_vide(f"{titre} — Aucune anomalie", 260)
-    d = socle.preparer(sub.head(top_n), axes).iloc[::-1]
-    survol = [
-        f"<b>{r['libelle_rang']}</b><br>{target} observe : {_fmt(r[COL_OBS])}"
-        f"<br>Predit : {_fmt(r[COL_PRED])}"
-        f"<br>Intervalle : [{_fmt(r[COL_LO])} ; {_fmt(r[COL_HI])}]"
-        f"<br>Score : {_fmt4(r[COL_SCORE])}"
-        for _, r in d.iterrows()]
-    montants = d[COL_OBS].tolist()
-    fig = go.Figure(go.Bar(
-        x=montants, y=d["libelle_rang"].tolist(), orientation="h",
-        showlegend=False,
-        marker=dict(color=montants, colorscale=ECHELLE,
-                    cmin=min(montants), cmax=max(montants),
-                    line=dict(width=.5, color="white"),
-                    colorbar=dict(title="Montant", thickness=14, len=.7, tickformat="~s")),
-        text=survol, hovertemplate="%{text}<extra></extra>",
-    ))
-    fig.update_layout(
-        xaxis=dict(tickformat="~s", title_text=f"<b>{target}</b>"),
-        yaxis=dict(tickfont=dict(size=10)),
-        title=dict(
-            text=f"Les {len(d)} anomalies les plus graves<br>"
-                 f"<sup>{titre}  ·  montants bruts, aucune sommation</sup>",
-            font=dict(size=14), x=.015, xanchor="left"),
-    )
-    _mise_en_forme(fig, max(380, 38 * len(d) + 150), dict(l=10, r=40, t=95, b=50))
-    return fig
+def _creer_barres():
+    fig = go.Figure(go.Bar(x=[], y=[], orientation="h", showlegend=False,
+                           marker=dict(colorscale=ECHELLE,
+                                       line=dict(width=.5, color="white"),
+                                       colorbar=dict(title="Montant",
+                                                     thickness=14, len=.7,
+                                                     tickformat="~s"))))
+    fig.update_layout(xaxis=dict(tickformat="~s"),
+                      yaxis=dict(tickfont=dict(size=10)))
+    _mise_en_forme(fig, 520, dict(l=10, r=40, t=95, b=50))
+    return go.FigureWidget(fig)
 
 
-def _fig_forest(socle, sub, titre, target, axes, top_n=TOP_N_PANNEAUX):
-    if not len(sub):
-        return _fig_vide(f"{titre} — Aucune anomalie", 260)
-    d = socle.preparer(sub.head(top_n), axes).iloc[::-1].reset_index(drop=True)
-    y   = list(range(len(d)))
-    lo  = d[COL_LO].to_numpy(dtype="float64")
-    hi  = d[COL_HI].to_numpy(dtype="float64")
-    obs = d[COL_OBS].to_numpy(dtype="float64")
-    pred= d[COL_PRED].to_numpy(dtype="float64")
-
-    xs_band, ys_band, xs_over, ys_over = [], [], [], []
-    for yi, l, h, o in zip(y, lo, hi, obs):
-        xs_band += [l, h, None]; ys_band += [yi, yi, None]
-        cible = h if o > h else l
-        xs_over += [cible, o, None]; ys_over += [yi, yi, None]
-
-    textes = [
-        f"<b>{r['libelle_rang']}</b><br>{target} observe : {_fmt(o)}"
-        f"<br>Predit : {_fmt(p)}<br>Intervalle : [{_fmt(l)} ; {_fmt(h)}]"
-        for (_, r), o, p, l, h in zip(d.iterrows(), obs, pred, lo, hi)]
-
+def _creer_forest(target):
     fig = go.Figure()
-    fig.add_scatter(x=xs_band, y=ys_band, mode="lines", hoverinfo="skip",
-                    opacity=.35, line=dict(color="#3a6bbf", width=10),
-                    name="Intervalle conforme")
-    fig.add_scatter(x=xs_over, y=ys_over, mode="lines", showlegend=False,
-                    hoverinfo="skip", line=dict(color=_ACCENT, width=2, dash="dot"))
-    fig.add_scatter(x=pred, y=y, mode="markers", name="Prediction",
+    fig.add_scatter(x=[], y=[], mode="lines", hoverinfo="skip", opacity=.35,
+                    line=dict(color="#3a6bbf", width=10),
+                    name="Intervalle conforme")                     # 0 bande
+    fig.add_scatter(x=[], y=[], mode="lines", showlegend=False, hoverinfo="skip",
+                    line=dict(color=_ACCENT, width=2, dash="dot"))  # 1 depassement
+    fig.add_scatter(x=[], y=[], mode="markers", name="Prediction",
                     marker=dict(symbol="diamond", size=10, color="white",
-                                line=dict(color="black", width=1.5)),
-                    text=textes, hovertemplate="%{text}<extra></extra>")
-    fig.add_scatter(x=obs, y=y, mode="markers", name="Valeur observee",
+                                line=dict(color="black", width=1.5)))  # 2 pred
+    fig.add_scatter(x=[], y=[], mode="markers", name="Valeur observee",
                     marker=dict(size=13, color=_ACCENT,
-                                line=dict(color="#7b241c", width=1.3)),
-                    text=textes, hovertemplate="%{text}<extra></extra>")
+                                line=dict(color="#7b241c", width=1.3)))  # 3 obs
     fig.update_xaxes(tickformat="~s", title_text=f"<b>{target}</b>")
-    fig.update_layout(
-        yaxis=dict(tickmode="array", tickvals=y,
-                   ticktext=d["libelle_rang"].str.slice(0, 40).tolist(),
-                   tickfont=dict(size=10)),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=.5),
-        title=dict(
-            text="Intervalle conforme, prediction et valeur observee<br>"
-                 f"<sup>{titre}  ·  valeurs brutes de df, aucune sommation</sup>",
-            font=dict(size=14), x=.015, xanchor="left"),
-    )
-    _mise_en_forme(fig, max(420, 44 * len(d) + 175), dict(l=10, r=50, t=115, b=55))
-    return fig
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                  xanchor="center", x=.5))
+    _mise_en_forme(fig, 520, dict(l=10, r=50, t=115, b=55))
+    return go.FigureWidget(fig)
 
 
-def _fig_evolution(socle, cle_str, target, alpha):
-    if cle_str is None:
-        return _fig_vide("Aucune anomalie dans ce perimetre.")
-    r = socle.ligne(socle.ano, cle_str)
-    ctx = socle.contexte(r)
-    hist, per = socle.historique(cle_str)
-    if hist is None or not len(hist):
-        return _fig_vide("Aucun historique pour ce sous-portefeuille.")
-
-    val = hist[target].to_numpy(dtype="float64")
-    p_valide = (ctx["per"] if ctx and ctx.get("per") in per else per[-1])
-    xb = yb = xp = yp = xh = yh = []
-    if ctx:
-        xb, yb = [p_valide, p_valide], [ctx["lo"], ctx["hi"]]
-        xp, yp = [p_valide], [ctx["pred"]]
-        xh, yh = [p_valide], [ctx["obs"]]
-    couvert = bool(ctx["couvert"]) if ctx else True
-    coul = _OK if couvert else _ACCENT
-    halo = "rgba(61,90,158,0.18)" if couvert else "rgba(192,57,43,0.20)"
-    alerte = (f"  ·  <b>un seul trimestre dans df : pas de courbe possible</b>"
-              if len(hist) < 2 else "")
-    cle_parts = cle_str.split(SEP)
-
+def _creer_evolution(target):
+    """Courbe d'evolution, avec l'intervalle conforme et la prediction."""
     fig = go.Figure()
-    fig.add_scatter(x=per, y=val, mode="lines", line=dict(color=_VIDE, width=0),
+    fig.add_scatter(x=[], y=[], mode="lines", line=dict(color=_VIDE, width=0),
                     fill="tozeroy", fillcolor="rgba(140,147,165,0.10)",
-                    showlegend=False, hoverinfo="skip")
-    fig.add_scatter(x=xb, y=yb, mode="lines", line=dict(color=_BLEU, width=15),
-                    opacity=.26, name=f"Intervalle conforme {100*(1-alpha):.0f} %")
-    fig.add_scatter(x=xp, y=yp, mode="markers", name="Prediction",
+                    showlegend=False, hoverinfo="skip")                # 0 aire
+    fig.add_scatter(x=[], y=[], mode="lines", line=dict(color=_BLEU, width=15),
+                    opacity=.26, name="Intervalle conforme")           # 1 bande
+    fig.add_scatter(x=[], y=[], mode="markers", name="Prediction",
                     marker=dict(symbol="diamond", size=11, color="white",
-                                line=dict(color=_ENCRE, width=1.8)))
-    fig.add_scatter(x=per, y=val, mode="lines+markers+text", name=target,
-                    line=dict(color=_ENCRE, width=2.8, shape="spline", smoothing=.55),
-                    marker=dict(size=9, color="white", line=dict(color=_ENCRE, width=2.2)),
-                    text=[_fmt(v) for v in val], textposition="top center",
-                    textfont=dict(size=9.5, color=_GRIS),
-                    hovertemplate=f"<b>%{{x}}</b><br>{target} : <b>%{{y:,.0f}}</b><extra></extra>")
-    fig.add_scatter(x=xh, y=yh, mode="markers", showlegend=False, hoverinfo="skip",
-                    marker=dict(size=34, color=halo))
-    fig.add_scatter(x=xh, y=yh, mode="markers",
-                    name="Couvert" if couvert else "Hors intervalle",
-                    marker=dict(size=13, color=coul, line=dict(color="white", width=2.4)))
+                                line=dict(color=_ENCRE, width=1.8)))   # 2 pred
+    fig.add_scatter(x=[], y=[], mode="lines+markers+text", name=target,
+                    line=dict(color=_ENCRE, width=2.8, shape="spline",
+                              smoothing=.55),
+                    marker=dict(size=9, color="white",
+                                line=dict(color=_ENCRE, width=2.2)),
+                    textposition="top center",
+                    textfont=dict(size=9.5, color=_GRIS))              # 3 cible
+    fig.add_scatter(x=[], y=[], mode="markers", showlegend=False,
+                    hoverinfo="skip",
+                    marker=dict(size=34, color="rgba(192,57,43,0.20)"))  # 4 halo
+    fig.add_scatter(x=[], y=[], mode="markers", name="Statut",
+                    marker=dict(size=13, color=_ACCENT,
+                                line=dict(color="white", width=2.4)))  # 5 statut
     fig.update_xaxes(showgrid=False, linecolor=_GRILLE, showspikes=True,
                      spikemode="across", spikethickness=1.2, spikedash="dot",
                      spikecolor=_GRIS, title_text="<b>Trimestre</b>")
     fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat="~s",
                      title_text=f"<b>{target}</b>")
     _mise_en_forme(fig, 420, dict(l=85, r=45, t=95, b=45))
-    fig.update_layout(
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.06, x=1, xanchor="right", font=dict(size=11)),
-        title=dict(
-            text=(f"<b>#{ctx['rang'] if ctx else '?'}  {' | '.join(cle_parts)}</b><br>"
-                  f"<span style='font-size:11px'>{target} · {len(hist)} trimestre(s) · "
-                  f"{per[0]} → {per[-1]}"
-                  + (f" · periode validee <b>{p_valide}</b>" if ctx else "")
-                  + alerte + "</span>"),
-            font=dict(size=14), x=.015, xanchor="left"),
-    )
-    return fig
+    fig.update_layout(hovermode="x unified",
+                      legend=dict(orientation="h", y=1.06, x=1,
+                                  xanchor="right", font=dict(size=11)))
+    return go.FigureWidget(fig)
 
 
-def _fig_variables(socle, cle_str, target, alpha, n=N_VARS_EXPLIC):
-    if cle_str is None:
-        return _fig_vide("Aucune anomalie dans ce perimetre.", 260)
-    r = socle.ligne(socle.ano, cle_str)
-    ctx = socle.contexte(r)
-    hist, per = socle.historique(cle_str)
-    if hist is None or len(hist) < 3:
-        n_t = 0 if hist is None else len(hist)
-        return _fig_vide(f"Classement indisponible : {n_t} trimestre(s) (min 3).", 260)
-    t = socle.variables_explicatives(hist)
-    if not len(t):
-        return _fig_vide("Aucune variable explicative numerique exploitable.", 260)
-
-    p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
-    k = per.index(p_valide)
-    n_reel = min(n, len(t))
-    fig = make_subplots(rows=n_reel, cols=1, shared_xaxes=True,
-                        vertical_spacing=.055,
-                        subplot_titles=[t.iloc[i]["variable"] for i in range(n_reel)])
-    for i in range(n_reel):
+def _creer_variables(n=N_VARS_EXPLIC):
+    fig = make_subplots(rows=n, cols=1, shared_xaxes=True,
+                        vertical_spacing=.055, subplot_titles=[" "] * n)
+    for i in range(n):
         c = _DOUX[i % len(_DOUX)]
-        v = t.iloc[i]["variable"]
-        vals = hist[v].to_numpy(dtype="float64")
-        fig.add_scatter(x=per, y=vals, mode="lines+markers", showlegend=False,
-                        line=dict(color=c, width=2.3, shape="spline", smoothing=.55),
-                        marker=dict(size=6, color="white", line=dict(color=c, width=1.8)),
-                        hovertemplate=f"<b>%{{x}}</b><br>{v} : <b>%{{y:,.0f}}</b><extra></extra>",
-                        row=i+1, col=1)
-        fig.add_scatter(x=[per[k]], y=[vals[k]], mode="markers", showlegend=False,
-                        marker=dict(size=13, color=c, line=dict(color="white", width=2.2)),
-                        hoverinfo="skip", row=i+1, col=1)
+        fig.add_scatter(x=[], y=[], mode="lines+markers", showlegend=False,
+                        line=dict(color=c, width=2.3, shape="spline",
+                                  smoothing=.55),
+                        marker=dict(size=6, color="white",
+                                    line=dict(color=c, width=1.8)),
+                        row=i + 1, col=1)                       # 2i   courbe
+        fig.add_scatter(x=[], y=[], mode="markers", showlegend=False,
+                        hoverinfo="skip",
+                        marker=dict(size=13, color=c,
+                                    line=dict(color="white", width=2.2)),
+                        row=i + 1, col=1)                       # 2i+1 trimestre
     fig.update_xaxes(showgrid=False, showticklabels=False, linecolor=_GRILLE)
-    fig.update_xaxes(showticklabels=True, title_text="<b>Trimestre</b>", row=n_reel, col=1)
-    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat="~s", tickfont=dict(size=9))
-    _mise_en_forme(fig, 150 * n_reel + 120, dict(l=85, r=45, t=95, b=45))
-    fig.update_layout(
-        hovermode="x unified",
-        title=dict(text="<b>Les variables qui expliquent ce comportement</b>",
-                   font=dict(size=14), x=.015, xanchor="left"))
+    fig.update_xaxes(showticklabels=True, title_text="<b>Trimestre</b>",
+                     row=n, col=1)
+    fig.update_yaxes(gridcolor=_GRILLE, zeroline=False, tickformat="~s",
+                     tickfont=dict(size=9))
+    _mise_en_forme(fig, 150 * n + 120, dict(l=85, r=45, t=95, b=45))
+    fig.update_layout(hovermode="x unified")
     for a in fig.layout.annotations:
         a.update(x=0, xanchor="left", font=dict(size=12, color=_GRIS))
-    return fig
+    return go.FigureWidget(fig)
+
+
+def _vider(fw, message, hauteur=260):
+    """Vide vraiment : x, y, text et annotations."""
+    with fw.batch_update():
+        for t in fw.data:
+            t.x, t.y = [], []
+            if "text" in t:
+                t.text = []
+            if t.type == "sunburst":
+                t.ids, t.labels, t.parents, t.values = [], [], [], []
+        for a in fw.layout.annotations:
+            a.text = " "
+        fw.layout.title = dict(text=message, font=dict(size=14), x=.015,
+                               xanchor="left")
+        fw.layout.height = hauteur
 
 
 # =============================================================================
-# CARTES KPI
+#  3. LE TABLEAU DE BORD
 # =============================================================================
-def _cartes_dash(sub, titre, score_global):
-    if not len(sub):
-        return html.Div("Aucune anomalie dans ce perimetre.", className="text-muted p-3")
-    part = sub[COL_SCORE].sum() / score_global if len(sub) else 0
-    hors = int((~((sub[COL_OBS] >= sub[COL_LO]) & (sub[COL_OBS] <= sub[COL_HI]))).sum())
-    cartes = [
-        ("Anomalies",       f"{len(sub):,}".replace(",", " "), "#37474f"),
-        ("Part du score",   f"{100 * part:.1f} %",             "#ad1457"),
-        ("Hors intervalle", f"{hors:,}".replace(",", " "),     "#00838f"),
-        ("Gravite moyenne", _fmt4(sub[COL_SCORE].mean()),       "#5e35b1"),
-        ("Pire anomalie",   _fmt4(sub[COL_SCORE].max()),        "#6a1b9a"),
-    ]
-    return html.Div([
-        html.Div(titre, style={"fontSize": "15px", "fontWeight": "600",
-                               "color": "#263238", "marginBottom": "10px",
-                               "fontFamily": "system-ui,sans-serif"}),
-        html.Div([
-            html.Div([
-                html.Div(t, style={"fontSize": "10.5px", "color": "#78909c",
-                                   "textTransform": "uppercase", "letterSpacing": ".6px"}),
-                html.Div(v, style={"fontSize": "19px", "fontWeight": "600",
-                                   "color": c, "marginTop": "4px"}),
-            ], style={"flex": "1", "minWidth": "130px", "background": "#fff",
-                      "border": "1px solid #e0e0e0",
-                      "borderLeft": f"5px solid {c}",
-                      "borderRadius": "7px", "padding": "11px 13px",
-                      "boxShadow": "0 1px 3px rgba(0,0,0,.07)"})
-            for t, v, c in cartes
-        ], style={"display": "flex", "gap": "9px", "flexWrap": "wrap"}),
-    ], style={"fontFamily": "system-ui,sans-serif", "margin": "6px 0 14px 0"})
+def tableau_de_bord_unifie(df, id_cols=None, target=None, alpha=None,
+                           top_n=TOP_N_PANNEAUX):
+    id_cols = id_cols if id_cols is not None else _session("ID_COLS")[1]
+    target = target if target is not None else _session("TARGET")[1]
+    if alpha is None:
+        ok, a = _session("ALPHA")
+        alpha = a if ok else .10
+    if id_cols is None or target is None:
+        raise NameError("ID_COLS et TARGET doivent exister dans la session.")
 
+    socle = _Socle(df, id_cols, target, alpha)
+    cles = socle.cles
+    defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk")
+                          if c in cles), cles[0])
 
-# =============================================================================
-# TABLEAU
-# =============================================================================
-def _tableau_dash(socle, sub, titre, axes):
-    if not len(sub):
-        return html.P(f"Aucune anomalie dans le perimetre : {titre}", className="text-muted")
-    d = socle.preparer(sub.head(N_LIGNES_TABLE), axes)
-    t = pd.DataFrame({
-        "Rang":    d["rang"].values,
-        "Maille":  d["libelle"].values,
-        "Y_obs":   d[COL_OBS].values,
-        "Y_pred":  d[COL_PRED].values,
-        "CP_bas":  d[COL_LO].values,
-        "CP_haut": d[COL_HI].values,
-        "Couvert": ((d[COL_OBS] >= d[COL_LO]) & (d[COL_OBS] <= d[COL_HI])).values,
-        "Score":   d[COL_SCORE].values,
-    })
-    for c in ["Y_obs", "Y_pred", "CP_bas", "CP_haut"]:
-        t[c] = t[c].round(0).astype(int)
-    t["Score"] = t["Score"].round(4)
-    return dash_table.DataTable(
-        data=t.to_dict("records"),
-        columns=[{"name": c, "id": c} for c in t.columns],
-        page_size=N_LIGNES_TABLE,
-        style_table={"overflowX": "auto"},
-        style_header={"backgroundColor": _ENCRE, "color": "white",
-                      "fontWeight": "bold", "fontSize": "12px"},
-        style_data_conditional=[
-            {"if": {"filter_query": "{Couvert} = False"},
-             "backgroundColor": "#FFEBEE", "color": _ACCENT},
-            {"if": {"column_id": "Score"},
-             "background": "linear-gradient(90deg,#fff 0%,#ffcdd2 100%)"},
-        ],
-        style_cell={"fontSize": "12px", "padding": "6px",
-                    "fontFamily": "system-ui,sans-serif"},
-    )
+    # ------------------------------------------------------------- widgets
+    axes_btns = [widgets.ToggleButton(
+        value=(c in cles[:2]), description=c,
+        layout=widgets.Layout(width="auto"),
+        button_style="info") for c in cles]
 
+    sel_maille = widgets.Dropdown(
+        options=[(c, c) for c in cles], value=defaut_maille,
+        description="Maille :", layout=widgets.Layout(width="330px"),
+        style={"description_width": "72px"})
+    sel_valeur = widgets.Dropdown(
+        options=[("— vue generale —", VUE_GENERALE)], value=VUE_GENERALE,
+        description="Valeur :", layout=widgets.Layout(width="470px"),
+        style={"description_width": "72px"})
+    sel_unite = widgets.Dropdown(
+        options=[], description="Anomalie :",
+        layout=widgets.Layout(width="720px"),
+        style={"description_width": "72px"})
 
-# =============================================================================
-# CHARGEMENT DES DONNEES (depuis Domino — meme chemin que le notebook)
-# =============================================================================
-TARGET  = "Claims_incurred"
-ALPHA   = 0.10
-ID_COLS_CANDIDATS = ["Partner", "Companies", "Lob", "Activity", "Periodicity", "Risk"]
+    # ------------------------------------------------------------ figures
+    fw_cercle = _creer_cercle()
+    fw_barres = _creer_barres()
+    fw_forest = _creer_forest(target)
+    fw_evol = _creer_evolution(target)
+    fw_vars = _creer_variables()
+    z_cartes, z_table = widgets.Output(), widgets.Output()
+    verrou = {"actif": False}
+    etat = {"sub": pd.DataFrame()}     # les anomalies du perimetre courant
 
-base_path     = Path("/domino/datasets/local/conformal_pred_actuariat/DataSet")
-target_folder = base_path / "Dossier_concatenee"
+    def _axes_actifs():
+        actifs = [c for c, b in zip(cles, axes_btns) if b.value]
+        return actifs or [cles[0]]        # jamais zero axe
 
-_parquets = sorted(target_folder.glob("*.parquet")) if target_folder.exists() else []
-if _parquets:
-    print(f"Chargement : {_parquets[0].name}")
-    df = pd.read_parquet(_parquets[0])
-elif (target_folder / "anomalies_prio.pkl").exists():
-    print("Chargement : anomalies_prio.pkl")
-    df = pd.read_pickle(target_folder / "anomalies_prio.pkl")
-else:
-    raise FileNotFoundError(
-        f"Aucun fichier de donnees trouve dans {target_folder}")
-
-df.drop(columns=["annee"], inplace=True, errors="ignore")
-ID_COLS = [c for c in ID_COLS_CANDIDATS if c in df.columns]
-print(f"Donnees : {len(df):,} lignes · TARGET={TARGET} · ID_COLS={ID_COLS}".replace(",", " "))
-
-socle = _Socle(df, ID_COLS, TARGET, ALPHA)
-defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk") if c in socle.cles),
-                     socle.cles[0])
-
-# =============================================================================
-# APPLICATION DASH
-# =============================================================================
-app = _DashClass(__name__,
-                 external_stylesheets=[dbc.themes.BOOTSTRAP],
-                 suppress_callback_exceptions=True,
-                 title="Dashboard Conformal Prediction")
-
-_BANDEAU_STYLE = {"fontFamily": "system-ui,sans-serif", "fontSize": "12.5px",
-                  "borderRadius": "6px", "padding": "9px 13px", "margin": "14px 0 8px 0"}
-
-app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
-
-    html.Div([
-        html.Span("Tableau de bord — Anomalies conformes",
-                  style={"fontWeight": "600", "fontSize": "16px", "color": "#0d47a1"}),
-        html.Span("  |  IFRS 17 / Solvabilite II · Conformal Prediction",
-                  style={"fontSize": "12px", "color": "#546e7a"}),
-    ], style={"background": "#e3f2fd", "padding": "12px 18px",
-              "borderRadius": "8px", "marginBottom": "14px",
-              "borderLeft": "5px solid #1565C0"}),
-
-    html.Div([
-        html.Div("Axes — structurent le cercle et composent les libelles.",
-                 style={**_BANDEAU_STYLE, "background": "#e3f2fd", "color": "#0d47a1"}),
-        dcc.Checklist(
-            id="axes-check",
-            options=[{"label": f"  {c}", "value": c} for c in socle.cles],
-            value=socle.cles[:2],
-            inline=True,
-            inputStyle={"marginRight": "4px"},
-            labelStyle={"marginRight": "16px", "fontSize": "13px",
-                        "background": "#1565C0", "color": "white",
-                        "padding": "5px 12px", "borderRadius": "4px",
-                        "cursor": "pointer"},
-        ),
-    ]),
-
-    dcc.Graph(id="g-cercle", config={"displayModeBar": False}),
-
-    html.Div("Perimetre — la maille et la valeur filtrent tout le tableau de bord.",
-             style={**_BANDEAU_STYLE, "background": "#e8f5e9", "color": "#1b5e20"}),
-    dbc.Row([
-        dbc.Col(dcc.Dropdown(
-            id="dd-maille",
-            options=[{"label": c, "value": c} for c in socle.cles],
-            value=defaut_maille, clearable=False,
-        ), md=4),
-        dbc.Col(dcc.Dropdown(
-            id="dd-valeur",
-            options=socle.options_valeurs(defaut_maille),
-            value=VUE_GENERALE,
-            placeholder="— vue generale —",
-        ), md=8),
-    ], className="mb-2"),
-
-    html.Div(id="zone-cartes"),
-
-    dcc.Graph(id="g-barres"),
-    dcc.Graph(id="g-forest"),
-
-    html.Div("L'anomalie en detail — evolution et variables explicatives.",
-             style={**_BANDEAU_STYLE, "background": "#fff3e0", "color": "#e65100"}),
-    dcc.Dropdown(id="dd-unite", options=[], value=None,
-                 placeholder="Anomalie…", style={"marginBottom": "8px"}),
-    dcc.Graph(id="g-evol"),
-    dcc.Graph(id="g-vars"),
-
-    html.Div("Tableau de priorisation.",
-             style={**_BANDEAU_STYLE, "background": "#eceff1", "color": "#37474f"}),
-    html.Div(id="zone-tableau"),
-
-    html.Div(style={"height": "40px"}),
-])
-
-
-# =============================================================================
-# CALLBACKS
-# =============================================================================
-
-@app.callback(
-    Output("dd-valeur", "options"),
-    Output("dd-valeur", "value"),
-    Input("dd-maille", "value"),
-)
-def cb_valeur_options(maille):
-    return socle.options_valeurs(maille or defaut_maille), VUE_GENERALE
-
-
-@app.callback(
-    Output("zone-cartes", "children"),
-    Output("g-cercle",    "figure"),
-    Output("g-barres",    "figure"),
-    Output("g-forest",    "figure"),
-    Output("dd-unite",    "options"),
-    Output("dd-unite",    "value"),
-    Input("axes-check",   "value"),
-    Input("dd-maille",    "value"),
-    Input("dd-valeur",    "value"),
-    Input("g-cercle",     "clickData"),
-)
-def cb_panneaux(axes, maille, valeur, click_data):
-    ctx = callback_context
-    triggered = ctx.triggered_id if ctx.triggered_id else "dd-maille"
-
-    if triggered == "g-cercle" and click_data:
+    # --------------------------------------------------------- le cercle
+    def _maj_cercle(sub, titre):
+        axes = _axes_actifs()
         try:
-            point_id = click_data["points"][0]["id"]
-            parts = point_id.split(SEP)
-            axes_actifs = axes or [socle.cles[0]]
-            if parts and len(parts) <= len(axes_actifs):
-                maille = axes_actifs[len(parts) - 1]
-                valeur = parts[-1]
-        except Exception:
-            pass
+            h = socle.hierarchie(sub, axes)
+            if not len(h):
+                _vider(fw_cercle, "Aucune anomalie a representer.", 300)
+                return
+            cmax = float(np.nanpercentile(h["score_moyen"], 95))
+            if not np.isfinite(cmax) or cmax <= 0:
+                cmax = float(h["score_moyen"].max()) or 1.0
+            survol = [
+                f"<b>{r['label']}</b><br>"
+                f"Gravite moyenne : {_fmt4(r['score_moyen'])}<br>"
+                f"Anomalies : {int(r['n'])}<br>"
+                f"Score cumule : {_fmt4(r['score_total'])} "
+                f"({r['part']:.1f} % du perimetre)<br>"
+                f"Pire anomalie : {_fmt4(r['score_max'])}"
+                for _, r in h.iterrows()]
+            with fw_cercle.batch_update():
+                t = fw_cercle.data[0]
+                t.ids, t.labels = h["id"].tolist(), h["label"].tolist()
+                t.parents = h["parent"].tolist()
+                t.values = h["valeur_secteur"].tolist()
+                t.branchvalues = "remainder"
+                t.text = [f"{p:.0f} %" for p in h["part"]]
+                t.texttemplate = "%{label}<br>%{text}"
+                t.hovertext, t.hoverinfo = survol, "text"
+                t.insidetextorientation = "radial"
+                t.maxdepth = len(axes)
+                t.marker = dict(
+                    colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
+                    cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
+                    colorbar=dict(title="Gravite<br>moyenne", thickness=16,
+                                  len=.7, tickformat="~s"))
+                fw_cercle.layout.height = 620
+                fw_cercle.layout.title = dict(
+                    text=f"Repartition des anomalies  ·  {' › '.join(axes)}"
+                         f"<br><sup>{titre}</sup>",
+                    font=dict(size=15), x=.015, xanchor="left")
+        except Exception as e:
+            #  Une exception avalee par ipywidgets laisserait un cercle blanc
+            #  sans explication. On garde le dessin precedent et on le dit.
+            print(f"Cercle non mis a jour : {type(e).__name__} : {str(e)[:120]}")
 
-    axes_actifs = axes or [socle.cles[0]]
-    sub, titre = socle.filtrer(maille or defaut_maille, valeur or VUE_GENERALE)
+    # --------------------------------------------------------- les cartes
+    def _cartes(sub, titre):
+        part = sub[COL_SCORE].sum() / socle.score_global if len(sub) else 0
+        hors = int((~((sub[COL_OBS] >= sub[COL_LO])
+                      & (sub[COL_OBS] <= sub[COL_HI]))).sum()) if len(sub) else 0
+        cartes = [("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
+                  ("Part du score global", f"{100 * part:.1f} %", "#ad1457"),
+                  ("Hors intervalle", f"{hors:,}".replace(",", " "), "#00838f"),
+                  ("Gravite moyenne",
+                   _fmt4(sub[COL_SCORE].mean()) if len(sub) else "—", "#5e35b1"),
+                  ("Pire anomalie",
+                   _fmt4(sub[COL_SCORE].max()) if len(sub) else "—", "#6a1b9a")]
+        blocs = "".join(
+            f"<div style='flex:1;min-width:130px;background:#fff;"
+            f"border:1px solid #e0e0e0;border-left:5px solid {c};"
+            f"border-radius:7px;padding:11px 13px;"
+            f"box-shadow:0 1px 3px rgba(0,0,0,.07)'>"
+            f"<div style='font-size:10.5px;color:#78909c;"
+            f"text-transform:uppercase;letter-spacing:.6px'>{t}</div>"
+            f"<div style='font-size:19px;font-weight:600;color:{c};"
+            f"margin-top:4px'>{v}</div></div>" for t, v, c in cartes)
+        return HTML(
+            f"<div style='font-family:system-ui,sans-serif;margin:6px 0 14px 0'>"
+            f"<div style='font-size:15px;font-weight:600;color:#263238;"
+            f"margin-bottom:10px'>{titre}</div>"
+            f"<div style='display:flex;gap:9px;flex-wrap:wrap'>{blocs}</div></div>")
 
-    cartes  = _cartes_dash(sub, titre, socle.score_global)
-    f_cerc  = _fig_cercle(socle, sub, titre, axes_actifs)
-    f_barr  = _fig_barres(socle, sub, titre, TARGET, axes_actifs)
-    f_for   = _fig_forest(socle, sub, titre, TARGET, axes_actifs)
-    options = socle.unites(sub, axes_actifs)
-    val_u   = options[0]["value"] if options else None
+    # ---------------------------------------------------------- les barres
+    def _maj_barres(sub, titre):
+        axes = _axes_actifs()
+        if not len(sub):
+            _vider(fw_barres, f"{titre}<br><sup>Aucune anomalie</sup>", 260)
+            return
+        #  Une barre par ANOMALIE, montant brut de la ligne. Aucun cumul.
+        d = socle.preparer(sub.head(top_n), axes).iloc[::-1]
+        survol = [
+            f"<b>{r['libelle_rang']}</b><br>{target} observe : {_fmt(r[COL_OBS])}"
+            f"<br>Predit : {_fmt(r[COL_PRED])}"
+            f"<br>Intervalle : [{_fmt(r[COL_LO])} ; {_fmt(r[COL_HI])}]"
+            f"<br>Score : {_fmt4(r[COL_SCORE])}"
+            for _, r in d.iterrows()]
+        montants = d[COL_OBS].tolist()
+        with fw_barres.batch_update():
+            t = fw_barres.data[0]
+            t.x, t.y = montants, d["libelle_rang"].tolist()
+            t.marker.color = montants
+            t.marker.cmin, t.marker.cmax = min(montants), max(montants)
+            t.text, t.hovertemplate = survol, "%{text}<extra></extra>"
+            fw_barres.layout.xaxis.title.text = f"<b>{target}</b>"
+            fw_barres.layout.height = max(380, 38 * len(d) + 150)
+            fw_barres.layout.title = dict(
+                text=f"Les {len(d)} anomalies les plus graves"
+                     f"<br><sup>{titre}  ·  montants bruts, aucune "
+                     "sommation</sup>",
+                font=dict(size=14), x=.015, xanchor="left")
 
-    return cartes, f_cerc, f_barr, f_for, options, val_u
+    # ---------------------------------------------------------- le forest
+    def _maj_forest(sub, titre):
+        axes = _axes_actifs()
+        if not len(sub):
+            _vider(fw_forest, f"{titre}<br><sup>Aucune anomalie</sup>", 260)
+            return
+        d = socle.preparer(sub.head(top_n), axes).iloc[::-1].reset_index(drop=True)
+        y = list(range(len(d)))
+        lo = d[COL_LO].to_numpy(dtype="float64")
+        hi = d[COL_HI].to_numpy(dtype="float64")
+        obs = d[COL_OBS].to_numpy(dtype="float64")
+        pred = d[COL_PRED].to_numpy(dtype="float64")
 
+        xs_band, ys_band, xs_over, ys_over = [], [], [], []
+        for yi, l, h, o in zip(y, lo, hi, obs):
+            xs_band += [l, h, None]
+            ys_band += [yi, yi, None]
+            cible = h if o > h else l
+            xs_over += [cible, o, None]
+            ys_over += [yi, yi, None]
 
-@app.callback(
-    Output("g-evol", "figure"),
-    Output("g-vars", "figure"),
-    Input("dd-unite", "value"),
-)
-def cb_detail(unite):
-    return _fig_evolution(socle, unite, TARGET, ALPHA), \
-           _fig_variables(socle, unite, TARGET, ALPHA)
+        textes = [
+            f"<b>{r['libelle_rang']}</b><br>{target} observe : {_fmt(o)}"
+            f"<br>Predit : {_fmt(p)}<br>Intervalle : [{_fmt(l)} ; {_fmt(h)}]"
+            for (_, r), o, p, l, h in zip(d.iterrows(), obs, pred, lo, hi)]
 
+        with fw_forest.batch_update():
+            fw_forest.data[0].x, fw_forest.data[0].y = xs_band, ys_band
+            fw_forest.data[1].x, fw_forest.data[1].y = xs_over, ys_over
+            fw_forest.data[2].x, fw_forest.data[2].y = pred, y
+            fw_forest.data[2].text = textes
+            fw_forest.data[2].hovertemplate = "%{text}<extra></extra>"
+            fw_forest.data[3].x, fw_forest.data[3].y = obs, y
+            fw_forest.data[3].text = textes
+            fw_forest.data[3].hovertemplate = "%{text}<extra></extra>"
+            fw_forest.layout.xaxis.title.text = f"<b>{target}</b>"
+            fw_forest.layout.yaxis = dict(
+                tickmode="array", tickvals=y,
+                ticktext=d["libelle_rang"].str.slice(0, 40).tolist(),
+                tickfont=dict(size=10))
+            fw_forest.layout.height = max(420, 44 * len(d) + 175)
+            fw_forest.layout.title = dict(
+                text="Intervalle conforme, prediction et valeur observee"
+                     f"<br><sup>{titre}  ·  valeurs brutes de df, aucune "
+                     "sommation</sup>",
+                font=dict(size=14), x=.015, xanchor="left")
 
-@app.callback(
-    Output("zone-tableau", "children"),
-    Input("axes-check", "value"),
-    Input("dd-maille",  "value"),
-    Input("dd-valeur",  "value"),
-)
-def cb_tableau(axes, maille, valeur):
-    axes_actifs = axes or [socle.cles[0]]
-    sub, titre = socle.filtrer(maille or defaut_maille, valeur or VUE_GENERALE)
-    return _tableau_dash(socle, sub, titre, axes_actifs)
+    # ------------------------------------- evolution + variables explicatives
+    def _maj_unite(*_):
+        cle = sel_unite.value
+        if cle is None:
+            _vider(fw_evol, "Aucune anomalie dans ce perimetre.")
+            _vider(fw_vars, "Aucune anomalie dans ce perimetre.")
+            return
+        try:
+            r = socle.ligne(etat["sub"], cle)
+            ctx = socle.contexte(r)
+            hist, per = socle.historique(cle)
+            _maj_evolution(hist, per, ctx, cle)
+            _maj_variables(hist, per, ctx)
+        except Exception as e:
+            msg = f"Mise a jour impossible : {type(e).__name__} : {str(e)[:110]}"
+            _vider(fw_evol, msg)
+            _vider(fw_vars, msg)
+
+    def _maj_evolution(hist, per, ctx, cle):
+        if hist is None or not len(hist):
+            _vider(fw_evol, "Aucun historique pour ce sous-portefeuille.")
+            return
+        val = hist[target].to_numpy(dtype="float64")
+        p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
+        xb = yb = xp = yp = xh = yh = []
+        if ctx:
+            xb, yb = [p_valide, p_valide], [ctx["lo"], ctx["hi"]]
+            xp, yp = [p_valide], [ctx["pred"]]
+            xh, yh = [p_valide], [ctx["obs"]]
+        couvert = bool(ctx["couvert"]) if ctx else True
+        coul = _OK if couvert else _ACCENT
+        halo = "rgba(61,90,158,0.18)" if couvert else "rgba(192,57,43,0.20)"
+
+        #  Un seul point : il n'y a pas de ligne a tracer. On le dit plutot que
+        #  de laisser croire a un panneau casse.
+        alerte = ("  ·  <b style='color:" + _ACCENT + "'>un seul trimestre "
+                  "dans df : pas de courbe possible</b>" if len(hist) < 2 else "")
+        with fw_evol.batch_update():
+            fw_evol.data[0].x, fw_evol.data[0].y = per, val
+            fw_evol.data[1].x, fw_evol.data[1].y = xb, yb
+            fw_evol.data[1].name = f"Intervalle conforme {100 * (1 - alpha):.0f} %"
+            fw_evol.data[2].x, fw_evol.data[2].y = xp, yp
+            fw_evol.data[3].x, fw_evol.data[3].y = per, val
+            fw_evol.data[3].text = [_fmt(v) for v in val]
+            fw_evol.data[3].hovertemplate = ("<b>%{x}</b><br>" + target
+                                             + " : <b>%{y:,.0f}</b><extra></extra>")
+            fw_evol.data[4].x, fw_evol.data[4].y = xh, yh
+            fw_evol.data[4].marker.color = halo
+            fw_evol.data[5].x, fw_evol.data[5].y = xh, yh
+            fw_evol.data[5].marker.color = coul
+            fw_evol.data[5].name = "Couvert" if couvert else "Hors intervalle"
+            fw_evol.layout.height = 420
+            fw_evol.layout.title = dict(
+                text=f"<b style='color:{_ENCRE}'>#{ctx['rang'] if ctx else '?'}"
+                     f"  {' | '.join(cle)}</b>"
+                     f"<br><span style='font-size:11px'>{target} · "
+                     f"{len(hist)} trimestre(s) · {per[0]} → {per[-1]}"
+                     + (f" · periode validee <b>{p_valide}</b>" if ctx else "")
+                     + alerte + "</span>",
+                font=dict(size=14), x=.015, xanchor="left")
+
+    def _maj_variables(hist, per, ctx):
+        if hist is None or len(hist) < 3:
+            n = 0 if hist is None else len(hist)
+            _vider(fw_vars,
+                   f"Classement des variables indisponible : {n} trimestre(s) "
+                   "dans df, il en faut au moins 3.")
+            return
+        t = socle.variables_explicatives(hist)
+        if not len(t):
+            _vider(fw_vars, "Aucune variable explicative numerique exploitable.")
+            return
+        p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
+        k = per.index(p_valide)
+        with fw_vars.batch_update():
+            for i in range(N_VARS_EXPLIC):
+                t_l, t_p = fw_vars.data[2 * i], fw_vars.data[2 * i + 1]
+                ann = fw_vars.layout.annotations[i]
+                if i < len(t):
+                    v = t.iloc[i]["variable"]
+                    vals = hist[v].to_numpy(dtype="float64")
+                    t_l.x, t_l.y = per, vals
+                    t_l.hovertemplate = (f"<b>%{{x}}</b><br>{v} : "
+                                         "<b>%{y:,.0f}</b><extra></extra>")
+                    t_p.x, t_p.y = [per[k]], [vals[k]]
+                    ann.text = f"<b>{v}</b>"      # le nom seul, rien d'autre
+                    ann.font.color = _DOUX[i % len(_DOUX)]
+                else:
+                    t_l.x, t_l.y = [], []
+                    t_p.x, t_p.y = [], []
+                    ann.text = " "
+            fw_vars.layout.height = 150 * max(len(t), 1) + 120
+            fw_vars.layout.title = dict(
+                text="<b>Les variables qui expliquent ce comportement</b>",
+                font=dict(size=14), x=.015, xanchor="left")
+
+    # ----------------------------------------------------------- le tableau
+    def _maj_tableau(sub, titre):
+        with z_table:
+            #  clear_output(wait=True) n'efface qu'a l'arrivee du contenu
+            #  suivant : sans le try, une erreur laisserait l'ANCIEN tableau.
+            clear_output(wait=True)
+            try:
+                if not len(sub):
+                    print(f"Aucune anomalie dans le perimetre : {titre}")
+                    return
+                axes = _axes_actifs()
+                d = socle.preparer(sub.head(N_LIGNES_TABLE), axes)
+                #  Memes lignes, memes montants bruts que le forest plot.
+                t = pd.DataFrame({
+                    "Rang": d["rang"].values,
+                    "Maille": d["libelle"].values,
+                    "Y_obs": d[COL_OBS].values, "Y_pred": d[COL_PRED].values,
+                    "CP_bas": d[COL_LO].values, "CP_haut": d[COL_HI].values,
+                    "Couvert": ((d[COL_OBS] >= d[COL_LO])
+                                & (d[COL_OBS] <= d[COL_HI])).values,
+                    "Score": d[COL_SCORE].values})
+                fmt_col = {c: (lambda v: _fmt(v))
+                           for c in ("Y_obs", "Y_pred", "CP_bas", "CP_haut")}
+                fmt_col["Score"] = lambda v: _fmt4(v)
+                try:
+                    display(t.style
+                            .background_gradient(subset=["Score"], cmap="Reds")
+                            .format(fmt_col)
+                            .set_caption(f"Tableau de priorisation — {titre}"))
+                except Exception:
+                    display(t)
+            except Exception as e:
+                print(f"Tableau non genere : {type(e).__name__} : {str(e)[:150]}")
+
+    # -------------------------------------------------------- orchestration
+    def _options_valeurs(colonne):
+        g = (socle.ano.groupby(colonne, observed=True)[COL_SCORE]
+             .agg(["size", "sum"]).reset_index()
+             .sort_values("sum", ascending=False))
+        return [("— vue generale —", VUE_GENERALE)] + [
+            (f"{r[colonne]}   ({int(r['size'])} anomalies)", str(r[colonne]))
+            for _, r in g.iterrows()]
+
+    def _maj_panneaux(*_):
+        """Point d'entree unique : tout passe par ici, donc tout reste
+        coherent. Les axes comme la maille et la valeur y aboutissent."""
+        if verrou["actif"]:
+            return
+        axes = _axes_actifs()
+        sub, titre = socle.filtrer(sel_maille.value, sel_valeur.value)
+        etat["sub"] = sub
+
+        _maj_cercle(sub, titre)
+        with z_cartes:
+            clear_output(wait=True)
+            display(_cartes(sub, titre))
+        _maj_barres(sub, titre)
+        _maj_forest(sub, titre)
+
+        options = socle.unites(sub, axes)
+        verrou["actif"] = True
+        try:
+            ancienne = sel_unite.value
+            sel_unite.options = options
+            dispo = [v for _, v in options]
+            sel_unite.value = (ancienne if ancienne in dispo
+                               else (dispo[0] if dispo else None))
+        finally:
+            verrou["actif"] = False
+        _maj_unite()
+        _maj_tableau(sub, titre)
+
+    def _maj_valeurs(*_):
+        if verrou["actif"]:
+            return
+        verrou["actif"] = True
+        try:
+            sel_valeur.options = _options_valeurs(sel_maille.value)
+            sel_valeur.value = VUE_GENERALE
+        finally:
+            verrou["actif"] = False
+        _maj_panneaux()
+
+    def _au_clic_cercle(trace, points, state):
+        if not points.point_inds:
+            return
+        parts = trace.ids[points.point_inds[0]].split(SEP)
+        axes = _axes_actifs()
+        if not parts or len(parts) > len(axes):
+            return
+        colonne, valeur = axes[len(parts) - 1], parts[-1]
+        verrou["actif"] = True
+        try:
+            sel_maille.value = colonne
+            sel_valeur.options = _options_valeurs(colonne)
+            dispo = [v for _, v in sel_valeur.options]
+            sel_valeur.value = valeur if valeur in dispo else VUE_GENERALE
+        finally:
+            verrou["actif"] = False
+        _maj_panneaux()
+
+    # ------------------------------------------------------- branchements
+    for b in axes_btns:
+        b.observe(lambda c: _maj_panneaux() if c["name"] == "value" else None,
+                  names="value")
+    sel_maille.observe(lambda c: _maj_valeurs() if c["name"] == "value" else None,
+                       names="value")
+    sel_valeur.observe(lambda c: _maj_panneaux() if c["name"] == "value" else None,
+                       names="value")
+    sel_unite.observe(
+        lambda c: (_maj_unite() if not verrou["actif"] else None)
+        if c["name"] == "value" else None, names="value")
+    try:
+        fw_cercle.data[0].on_click(_au_clic_cercle)
+        clic = True
+    except Exception:
+        clic = False
+
+    # ---------------------------------------------------------- affichage
+    display(_bandeau(
+        "<b>Axes</b> — ils structurent le cercle et composent les libelles. "
+        "Ils ne modifient aucun montant : chaque ligne garde les valeurs de df."
+        + ("  Le clic sur une part du cercle filtre le perimetre."
+           if clic else ""),
+        fond="#e3f2fd", coul="#0d47a1"))
+    display(widgets.HBox(
+        axes_btns, layout=widgets.Layout(flex_flow="row wrap",
+                                         align_items="center")))
+    display(fw_cercle)
+
+    display(_bandeau(
+        "<b>Perimetre</b> — la maille et la valeur filtrent l'ensemble du "
+        "tableau de bord, cercle compris. Seules les anomalies "
+        f"({COL_SCORE} different de zero) sont affichees.",
+        fond="#e8f5e9", coul="#1b5e20"))
+    display(widgets.HBox([sel_maille, sel_valeur]))
+    display(z_cartes)
+    display(fw_barres)
+    display(fw_forest)
+
+    display(_bandeau(
+        "<b>L'anomalie en detail</b> — evolution de la cible sur son propre "
+        "historique, avec l'intervalle conforme et la prediction de la ligne, "
+        "puis les variables qui expliquent son comportement.",
+        fond="#fff3e0", coul="#e65100"))
+    display(sel_unite)
+    display(fw_evol)
+    display(fw_vars)
+
+    display(_bandeau("<b>Tableau de priorisation</b> — perimetre courant, "
+                     f"{N_LIGNES_TABLE} anomalies les plus graves."))
+    display(z_table)
+
+    _maj_valeurs()
+    return {"cercle": fw_cercle, "barres": fw_barres, "forest": fw_forest,
+            "evolution": fw_evol, "variables": fw_vars, "maille": sel_maille,
+            "valeur": sel_valeur, "unite": sel_unite, "axes": axes_btns,
+            "cartes": z_cartes, "tableau": z_table, "socle": socle,
+            "etat": etat, "rafraichir": _maj_panneaux}
 
 
 # =============================================================================
-# LANCEMENT
-# Affichage inline dans Jupyter/VSCode sur Domino (comme ipywidgets)
+#  4. EXECUTION AUTOMATIQUE
 # =============================================================================
-def lancer(port=8050, height=900):
-    """Appelle cette fonction dans une cellule Jupyter/VSCode pour afficher le dashboard."""
-    if _MODE_JUPYTER:
-        # JupyterDash : affiche directement dans la cellule (mode inline)
-        app.run_server(mode="inline", port=port, height=height)
-    else:
-        # Fallback : ouvre dans le navigateur
-        print(f"Dashboard sur http://localhost:{port}")
-        app.run(debug=False, port=port, host="0.0.0.0")
+_PREREQUIS = ["df", "ID_COLS", "TARGET"]
+_trouve = {n: _session(n) for n in _PREREQUIS}
+_manquants = [n for n, (ok, _) in _trouve.items() if not ok]
 
-
-# Appel direct si execute comme script (python tableau_de_bord_dash.py)
-if __name__ == "__main__":
-    lancer()
+if _manquants:
+    print("=" * 74)
+    print("TABLEAU DE BORD NON AFFICHE : variables absentes de la session")
+    print("=" * 74)
+    for n in _manquants:
+        print(f"  - {n}")
+    print("\nExecutez d'abord les cellules qui les creent, puis relancez "
+          "celle-ci.")
+else:
+    try:
+        controles = tableau_de_bord_unifie(
+            _trouve["df"][1], id_cols=_trouve["ID_COLS"][1],
+            target=_trouve["TARGET"][1])
+    except ValueError as _e:
+        #  Donnees inexploitables (aucune anomalie, aucune prediction, colonne
+        #  manquante) : un message suffit, un traceback ferait croire a un bug
+        #  du tableau de bord alors que c'est la base qui ne s'y prete pas.
+        print("=" * 74)
+        print("TABLEAU DE BORD NON AFFICHE")
+        print("=" * 74)
+        print(f"  {_e}")
