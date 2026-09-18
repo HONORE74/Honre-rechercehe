@@ -1,14 +1,9 @@
-# -*- coding: utf-8 -*-
 import os
-import json
-import numpy as np
-import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output, State, no_update, ctx
+from dash import Dash, dcc, html
 
-PORT = 8887
+PORT = 8824
+
 def get_request_prefix(port=PORT):
     """
     Generate the request prefix based on environment variables.
@@ -30,7 +25,7 @@ def get_request_prefix(port=PORT):
         port_str = str(port)  # Ensure port is a string
         vscode_proxy = ("VSCODE_PROXY_URI" in os.environ) and (
             "JUPYTER_SERVER_URL" not in os.environ
-        )  # detect if vscode is used to proxify the dash app
+        )  # detect if vscode is used to proxy the dash app
         prefix = f"/{owner}/{project}/{'r/' if vscode_proxy else ''}notebookSession/{run_id}/proxy/{port_str}/"
     elif "JUPYTER_BASE_PATH" in os.environ:
         # Case for Datacamp
@@ -40,11 +35,23 @@ def get_request_prefix(port=PORT):
     return prefix
 
 
+get_request_prefix()
+
+# Create app with routing config
+app = Dash(__name__,
+           routes_pathname_prefix='/',
+           requests_pathname_prefix=get_request_prefix())
+
+
 # =============================================================================
-#  Mon job est de remplacer cette partie par mon code
-#  (tableau de bord unifie - anomalies, evolution, priorisation - migre
-#  depuis la version ipywidgets vers Dash, servi via le proxy Domino)
+#  Mon code (migration du tableau de bord ipywidgets -> Dash)
 # =============================================================================
+import json
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from dash import Input, Output, State, no_update, ctx
 
 TOP_N_PANNEAUX = 12
 N_TRIMESTRES   = 10
@@ -206,6 +213,10 @@ class _Socle:
                 t0, t1 = self.trimestres[0], self.trimestres[-1]
                 print(f"   trimestres dans df : {t0[0]}-T{t0[1]} -> "
                       f"{t1[0]}-T{t1[1]}   ({len(self.trimestres)} au total)")
+                if len(self.trimestres) < 2:
+                    print("      ATTENTION : un seul trimestre dans df.")
+                elif len(self.trimestres) < 3:
+                    print("      NOTE : deux trimestres seulement.")
             print(f"   periode validee    : {per_txt}   "
                   f"({int(porte_cp.sum()):,} lignes avec prediction)"
                   .replace(",", " "))
@@ -485,7 +496,7 @@ def _fig_cercle(socle, sub, titre, axes):
                       len=.7, tickformat="~s"))
     fig.layout.height = 620
     fig.layout.title = dict(
-        text=f"Repartition des anomalies  ·  {' › '.join(axes)}"
+        text=f"Repartition des anomalies  ·  {' > '.join(axes)}"
              f"<br><sup>{titre}</sup>",
         font=dict(size=15), x=.015, xanchor="left")
     return fig
@@ -625,7 +636,7 @@ def _fig_evolution(hist, per, ctx_, cle, target, alpha):
         text=f"<b style='color:{_ENCRE}'>#{ctx_['rang'] if ctx_ else '?'}"
              f"  {' | '.join(cle)}</b>"
              f"<br><span style='font-size:11px'>{target} · "
-             f"{len(hist)} trimestre(s) · {per[0]} → {per[-1]}"
+             f"{len(hist)} trimestre(s) · {per[0]} -> {per[-1]}"
              + (f" · periode validee <b>{p_valide}</b>" if ctx_ else "")
              + alerte + "</span>",
         font=dict(size=14), x=.015, xanchor="left")
@@ -696,7 +707,10 @@ def _tableau(socle, sub, titre, axes, target):
         return html.P(f"Tableau non genere : {type(e).__name__} : {str(e)[:150]}")
 
 
-def construire_app(df, id_cols, target, alpha=.10, top_n=TOP_N_PANNEAUX):
+def configurer_app(app, df, id_cols, target, alpha=.10, top_n=TOP_N_PANNEAUX):
+    """Configure app.layout et les callbacks sur l'app Domino deja creee
+    (elle n'est pas recreee ici : c'est celle du gabarit, avec son prefixe
+    de proxy)."""
     socle = _Socle(df, id_cols, target, alpha)
     cles = socle.cles
     defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk")
@@ -715,11 +729,6 @@ def construire_app(df, id_cols, target, alpha=.10, top_n=TOP_N_PANNEAUX):
             {"label": f"{r[colonne]}   ({int(r['size'])} anomalies)",
              "value": str(r[colonne])}
             for _, r in g.iterrows()]
-
-    # Domino : app cree avec le prefixe de proxy (au lieu de Dash(__name__)).
-    app = Dash(__name__,
-               routes_pathname_prefix='/',
-               requests_pathname_prefix=get_request_prefix())
 
     axes_checklist = dcc.Checklist(
         id="axes-checklist",
@@ -888,8 +897,6 @@ def construire_app(df, id_cols, target, alpha=.10, top_n=TOP_N_PANNEAUX):
             return _vider(_creer_evolution(target), msg), \
                    _vider(_creer_variables(), msg)
 
-    return app
-
 
 # =============================================================================
 #  CHARGEMENT DES DONNEES
@@ -897,36 +904,25 @@ def construire_app(df, id_cols, target, alpha=.10, top_n=TOP_N_PANNEAUX):
 #  aux variables de ta session Jupyter. _session() reste par securite (si tu
 #  executes ce fichier via %run -i depuis un notebook), mais pour un vrai
 #  lancement d'app, REMPLACE ce bloc par ton propre chargement de df,
-#  ID_COLS, TARGET -- exactement comme le gabarit fait
-#  df = pd.read_csv('gapminder_unfiltered.csv').
+#  ID_COLS, TARGET.
 # =============================================================================
 _PREREQUIS = ["df", "ID_COLS", "TARGET"]
 _trouve = {n: _session(n) for n in _PREREQUIS}
 _manquants = [n for n, (ok, _) in _trouve.items() if not ok]
 
 if _manquants:
-    print("=" * 74)
     print("APP NON DEMARREE : variables absentes")
-    print("=" * 74)
     for n in _manquants:
         print(f"  - {n}")
-    print("\nAjoute ici ton chargement de df, ID_COLS, TARGET (dataset "
-          "Domino, parquet, etc.) avant cette section.")
-    app = Dash(__name__, routes_pathname_prefix='/',
-              requests_pathname_prefix=get_request_prefix())
     app.layout = html.Div("Donnees manquantes : voir la console du run.")
 else:
     try:
-        app = construire_app(
-            _trouve["df"][1], id_cols=_trouve["ID_COLS"][1],
-            target=_trouve["TARGET"][1])
+        configurer_app(app, _trouve["df"][1], id_cols=_trouve["ID_COLS"][1],
+                       target=_trouve["TARGET"][1])
     except ValueError as _e:
-        app = Dash(__name__, routes_pathname_prefix='/',
-                  requests_pathname_prefix=get_request_prefix())
         app.layout = html.Div(f"TABLEAU DE BORD NON AFFICHE : {_e}")
 
 
 #Cette partie par mon code
 
-if __name__ == '__main__':
-    app.run(jupyter_mode="external", debug=True, port=PORT)
+app.run(jupyter_mode="external", debug=True, port=PORT)
