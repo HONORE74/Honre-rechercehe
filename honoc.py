@@ -51,7 +51,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output, State, no_update
+from dash import Dash, dcc, html, Input, Output, State, no_update, ctx
 
 # ┌──────────────────────────── PARAMETRES ────────────────────────────┐
 TOP_N_PANNEAUX = 12       # barres et forest plot
@@ -691,18 +691,18 @@ def _fig_forest(socle, sub, titre, axes, target, top_n):
     return fig
 
 
-def _fig_evolution(hist, per, ctx, cle, target, alpha):
+def _fig_evolution(hist, per, ctx_, cle, target, alpha):
     fig = _creer_evolution(target)
     if hist is None or not len(hist):
         return _vider(fig, "Aucun historique pour ce sous-portefeuille.")
     val = hist[target].to_numpy(dtype="float64")
-    p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
+    p_valide = ctx_["per"] if ctx_ and ctx_.get("per") in per else per[-1]
     xb = yb = xp = yp = xh = yh = []
-    if ctx:
-        xb, yb = [p_valide, p_valide], [ctx["lo"], ctx["hi"]]
-        xp, yp = [p_valide], [ctx["pred"]]
-        xh, yh = [p_valide], [ctx["obs"]]
-    couvert = bool(ctx["couvert"]) if ctx else True
+    if ctx_:
+        xb, yb = [p_valide, p_valide], [ctx_["lo"], ctx_["hi"]]
+        xp, yp = [p_valide], [ctx_["pred"]]
+        xh, yh = [p_valide], [ctx_["obs"]]
+    couvert = bool(ctx_["couvert"]) if ctx_ else True
     coul = _OK if couvert else _ACCENT
     halo = "rgba(61,90,158,0.18)" if couvert else "rgba(192,57,43,0.20)"
 
@@ -725,17 +725,17 @@ def _fig_evolution(hist, per, ctx, cle, target, alpha):
     fig.data[5].name = "Couvert" if couvert else "Hors intervalle"
     fig.layout.height = 420
     fig.layout.title = dict(
-        text=f"<b style='color:{_ENCRE}'>#{ctx['rang'] if ctx else '?'}"
+        text=f"<b style='color:{_ENCRE}'>#{ctx_['rang'] if ctx_ else '?'}"
              f"  {' | '.join(cle)}</b>"
              f"<br><span style='font-size:11px'>{target} · "
              f"{len(hist)} trimestre(s) · {per[0]} → {per[-1]}"
-             + (f" · periode validee <b>{p_valide}</b>" if ctx else "")
+             + (f" · periode validee <b>{p_valide}</b>" if ctx_ else "")
              + alerte + "</span>",
         font=dict(size=14), x=.015, xanchor="left")
     return fig
 
 
-def _fig_variables(socle, hist, per, ctx):
+def _fig_variables(socle, hist, per, ctx_):
     fig = _creer_variables()
     if hist is None or len(hist) < 3:
         n = 0 if hist is None else len(hist)
@@ -745,7 +745,7 @@ def _fig_variables(socle, hist, per, ctx):
     t = socle.variables_explicatives(hist)
     if not len(t):
         return _vider(fig, "Aucune variable explicative numerique exploitable.")
-    p_valide = ctx["per"] if ctx and ctx.get("per") in per else per[-1]
+    p_valide = ctx_["per"] if ctx_ and ctx_.get("per") in per else per[-1]
     k = per.index(p_valide)
     for i in range(N_VARS_EXPLIC):
         t_l, t_p = fig.data[2 * i], fig.data[2 * i + 1]
@@ -935,23 +935,27 @@ def construire_app(df, id_cols=None, target=None, alpha=None,
 
     # ================================================================
     #  Callback 2 : la maille commande les options de "valeur"
-    #  (equivalent de _maj_valeurs). Le store est consomme une seule fois
-    #  puis remis a None, pour ne pas rejouer un ancien clic lors d'un
-    #  changement manuel ulterieur de la maille.
+    #  (equivalent de _maj_valeurs). Pas de reecriture dans le store : on
+    #  regarde juste, via ctx.triggered, si c'est un clic sur le cercle
+    #  (donc le store) qui a declenche l'appel, pour reprendre sa valeur ;
+    #  sinon (changement manuel de la maille, ou chargement initial) on
+    #  revient a la vue generale.
     # ================================================================
     @app.callback(
         Output("sel-valeur", "options"),
         Output("sel-valeur", "value"),
-        Output("store-clic-valeur", "data", allow_duplicate=True),
         Input("sel-maille", "value"),
         Input("store-clic-valeur", "data"),
-        prevent_initial_call=False,
     )
     def maj_valeurs(colonne, valeur_cliquee):
         options = _options_valeurs(colonne)
         dispo = [o["value"] for o in options]
-        valeur = (valeur_cliquee if valeur_cliquee in dispo else VUE_GENERALE)
-        return options, valeur, None
+        declencheurs = {t["prop_id"].split(".")[0] for t in ctx.triggered}
+        if "store-clic-valeur" in declencheurs and valeur_cliquee in dispo:
+            valeur = valeur_cliquee
+        else:
+            valeur = VUE_GENERALE
+        return options, valeur
 
     # ================================================================
     #  Callback 3 : point d'entree unique du rafraichissement des
@@ -1018,10 +1022,10 @@ def construire_app(df, id_cols=None, target=None, alpha=None,
         try:
             cle = _decode_cle(cle_encodee)
             r = socle.ligne(etat["sub"], cle)
-            ctx = socle.contexte(r)
+            ctx_ = socle.contexte(r)
             hist, per = socle.historique(cle)
-            return (_fig_evolution(hist, per, ctx, cle, target, alpha),
-                    _fig_variables(socle, hist, per, ctx))
+            return (_fig_evolution(hist, per, ctx_, cle, target, alpha),
+                    _fig_variables(socle, hist, per, ctx_))
         except Exception as e:
             msg = f"Mise a jour impossible : {type(e).__name__} : {str(e)[:110]}"
             return _vider(_creer_evolution(target), msg), \
