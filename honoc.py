@@ -51,7 +51,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Input, Output, State, no_update, ctx
+from dash import Input, Output, State, no_update, ctx, dash_table
 
 TOP_N_PANNEAUX = 12
 N_TRIMESTRES   = 10
@@ -169,7 +169,7 @@ class _Socle:
             if len(couples) > 1 and verbeux:
                 print(f"Note : {len(couples)} trimestres portent une "
                       f"prediction. Le plus recent est retenu "
-                      f"({self.periode[0]}-T{self.periode[1]}).")
+                      f"({self.periode[0]}-Q{self.periode[1]}).")
             valide = valide[(valide["year"].astype(int) == self.periode[0])
                             & (valide["quarter"].astype(int) == self.periode[1])]
 
@@ -204,15 +204,15 @@ class _Socle:
                                              df["quarter"].astype(int))))
 
         if verbeux:
-            per_txt = (f"{self.periode[0]}-T{self.periode[1]}"
+            per_txt = (f"{self.periode[0]}-Q{self.periode[1]}"
                        if self.periode else "non datee")
             print("=" * 74)
             print(f"SOURCE UNIQUE : df   ·   {len(df):,} lignes".replace(",", " "))
             print("=" * 74)
             if self.trimestres:
                 t0, t1 = self.trimestres[0], self.trimestres[-1]
-                print(f"   trimestres dans df : {t0[0]}-T{t0[1]} -> "
-                      f"{t1[0]}-T{t1[1]}   ({len(self.trimestres)} au total)")
+                print(f"   trimestres dans df : {t0[0]}-Q{t0[1]} -> "
+                      f"{t1[0]}-Q{t1[1]}   ({len(self.trimestres)} au total)")
                 if len(self.trimestres) < 2:
                     print("      ATTENTION : un seul trimestre dans df.")
                 elif len(self.trimestres) < 3:
@@ -265,7 +265,7 @@ class _Socle:
     def contexte(self, r):
         if r is None:
             return None
-        per = (f"{self.periode[0]}-T{self.periode[1]}" if self.periode else None)
+        per = (f"{self.periode[0]}-Q{self.periode[1]}" if self.periode else None)
         obs, lo, hi = float(r[COL_OBS]), float(r[COL_LO]), float(r[COL_HI])
         return dict(per=per, pred=float(r[COL_PRED]), lo=lo, hi=hi, obs=obs,
                     couvert=bool(lo <= obs <= hi), score=float(r[COL_SCORE]),
@@ -285,7 +285,7 @@ class _Socle:
         if {"year", "quarter"} <= set(d.columns):
             g = d.groupby(["year", "quarter"], observed=True)[colonnes] \
                  .sum().reset_index().sort_values(["year", "quarter"]).tail(n)
-            per = (g["year"].astype(int).astype(str) + "-T"
+            per = (g["year"].astype(int).astype(str) + "-Q"
                    + g["quarter"].astype(int).astype(str)).tolist()
             return g, per
         return d[colonnes].tail(n).reset_index(drop=True), \
@@ -503,24 +503,26 @@ def _fig_cercle(socle, sub, titre, axes):
 
 
 def _cartes(socle, sub, titre):
-    part = sub[COL_SCORE].sum() / socle.score_global if len(sub) else 0
-    hors = int((~((sub[COL_OBS] >= sub[COL_LO])
-                  & (sub[COL_OBS] <= sub[COL_HI]))).sum()) if len(sub) else 0
-    cartes = [("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
-              ("Part du score global", f"{100 * part:.1f} %", "#ad1457"),
-              ("Hors intervalle", f"{hors:,}".replace(",", " "), "#00838f"),
-              ("Gravite moyenne",
-               _fmt4(sub[COL_SCORE].mean()) if len(sub) else "—", "#5e35b1"),
-              ("Pire anomalie",
-               _fmt4(sub[COL_SCORE].max()) if len(sub) else "—", "#6a1b9a")]
+    if len(sub):
+        pire = sub.iloc[0]
+        pire_rang = int(pire["rang"])
+        obs_pire = _fmt(pire[COL_OBS])
+        interv_pire = f"[{_fmt(pire[COL_LO])} ; {_fmt(pire[COL_HI])}]"
+    else:
+        pire_rang, obs_pire, interv_pire = None, "—", "—"
+    cartes = [
+        ("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
+        ("Hors intervalle — rang 1", f"{obs_pire}  {interv_pire}", "#00838f"),
+        ("Pire anomalie", f"Rang {pire_rang}" if pire_rang else "—", "#6a1b9a"),
+    ]
     blocs = "".join(
-        f"<div style='flex:1;min-width:130px;background:#fff;"
+        f"<div style='flex:1;min-width:170px;background:#fff;"
         f"border:1px solid #e0e0e0;border-left:5px solid {c};"
         f"border-radius:7px;padding:11px 13px;"
         f"box-shadow:0 1px 3px rgba(0,0,0,.07)'>"
         f"<div style='font-size:10.5px;color:#78909c;"
         f"text-transform:uppercase;letter-spacing:.6px'>{t}</div>"
-        f"<div style='font-size:19px;font-weight:600;color:{c};"
+        f"<div style='font-size:17px;font-weight:600;color:{c};"
         f"margin-top:4px'>{v}</div></div>" for t, v, c in cartes)
     return (
         f"<div style='font-family:system-ui,sans-serif;margin:6px 0 14px 0'>"
@@ -683,26 +685,42 @@ def _tableau(socle, sub, titre, axes, target):
         return html.P(f"Aucune anomalie dans le perimetre : {titre}")
     try:
         d = socle.preparer(sub.head(N_LIGNES_TABLE), axes)
+        n = len(d)
         t = pd.DataFrame({
             "Rang": d["rang"].values,
             "Maille": d["libelle"].values,
-            "Y_obs": d[COL_OBS].values, "Y_pred": d[COL_PRED].values,
-            "CP_bas": d[COL_LO].values, "CP_haut": d[COL_HI].values,
-            "Couvert": ((d[COL_OBS] >= d[COL_LO])
-                        & (d[COL_OBS] <= d[COL_HI])).values,
-            "Score": d[COL_SCORE].values})
-        fmt_col = {c: (lambda v: _fmt(v))
-                   for c in ("Y_obs", "Y_pred", "CP_bas", "CP_haut")}
-        fmt_col["Score"] = lambda v: _fmt4(v)
-        try:
-            html_str = (t.style
-                        .background_gradient(subset=["Score"], cmap="Reds")
-                        .format(fmt_col)
-                        .set_caption(f"Tableau de priorisation — {titre}")
-                        .to_html())
-        except Exception:
-            html_str = t.to_html()
-        return dcc.Markdown(html_str, dangerously_allow_html=True)
+            "Y_obs": [_fmt(v) for v in d[COL_OBS]],
+            "Y_pred": [_fmt(v) for v in d[COL_PRED]],
+            "CP_bas": [_fmt(v) for v in d[COL_LO]],
+            "CP_haut": [_fmt(v) for v in d[COL_HI]],
+            "Couvert": np.where((d[COL_OBS] >= d[COL_LO])
+                                 & (d[COL_OBS] <= d[COL_HI]), "Oui", "Non"),
+            "Score": [_fmt4(v) for v in d[COL_SCORE]],
+        })
+        scores = d[COL_SCORE].to_numpy(dtype="float64")
+        smin, smax = float(scores.min()), float(scores.max())
+        etendue = (smax - smin) or 1.0
+        degrade = [{"if": {"row_index": i},
+                    "backgroundColor": f"rgba(198,40,40,{0.12 + 0.55 * (scores[i]-smin)/etendue})"}
+                   for i in range(n)]
+        return html.Div([
+            html.Div(f"Tableau de priorisation — {titre}",
+                     style={"fontWeight": "600", "fontSize": "14px",
+                            "margin": "4px 0 10px 0", "color": "#263238"}),
+            dash_table.DataTable(
+                data=t.to_dict("records"),
+                columns=[{"name": c, "id": c} for c in t.columns],
+                style_as_list_view=True,
+                style_table={"overflowX": "auto"},
+                style_cell={"fontFamily": "system-ui, sans-serif", "fontSize": "12.5px",
+                            "padding": "7px 12px", "border": "none",
+                            "borderBottom": "1px solid #eceff1"},
+                style_cell_conditional=[{"if": {"column_id": "Maille"}, "textAlign": "left"}],
+                style_header={"backgroundColor": "#f5f7fa", "fontWeight": "600",
+                              "border": "none", "borderBottom": "2px solid #cfd8dc"},
+                style_data_conditional=degrade,
+            ),
+        ])
     except Exception as e:
         return html.P(f"Tableau non genere : {type(e).__name__} : {str(e)[:150]}")
 
