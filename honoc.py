@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
 # TABLEAU DE BORD UNIFIE - anomalies, evolution, priorisation
-# VERSION DASH (remplace ipywidgets — compatible Domino WebApp)
+# VERSION DASH (remplace ipywidgets)
+# Affichage inline dans Jupyter / VSCode sur Domino (JupyterDash)
 #
 # Memes regles que l'original :
 # 1. SEULES LES ANOMALIES SONT AFFICHEES (score_composite != 0)
@@ -13,7 +14,16 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
-from dash import Dash, dcc, html, Input, Output, State, callback_context, dash_table, no_update
+
+# --- Dash : prefer JupyterDash pour l'affichage inline dans Jupyter/VSCode ---
+try:
+    from jupyter_dash import JupyterDash as _DashClass
+    _MODE_JUPYTER = True
+except ImportError:
+    from dash import Dash as _DashClass
+    _MODE_JUPYTER = False
+
+from dash import dcc, html, Input, Output, State, callback_context, dash_table, no_update
 import dash_bootstrap_components as dbc
 
 # ┌──────────────────────────── PARAMETRES ────────────────────────────┐
@@ -87,7 +97,7 @@ class _Socle:
             raise ValueError(f"df ne contient aucune des colonnes {COL_LO}, {COL_HI}, {COL_PRED}.")
         porte_cp = df[cp].notna().all(axis=1)
         if not porte_cp.any():
-            raise ValueError(f"Aucune ligne de df ne porte de prediction conforme ({cp} tous renseignes).")
+            raise ValueError(f"Aucune ligne de df ne porte de prediction conforme.")
 
         valide = df[porte_cp]
         self.periode = None
@@ -150,7 +160,6 @@ class _Socle:
         if not len(sub):
             return sub.assign(libelle=pd.Series(dtype=str))
         t = sub.copy()
-        # Correction bug .str : traitement separé selon len(axes)
         if len(axes) == 1:
             t["libelle"] = t[axes[0]].astype(str).str.slice(0, 38)
         else:
@@ -342,7 +351,6 @@ def _fig_barres(socle, sub, titre, target, axes, top_n=TOP_N_PANNEAUX):
     fig.update_layout(
         xaxis=dict(tickformat="~s", title_text=f"<b>{target}</b>"),
         yaxis=dict(tickfont=dict(size=10)),
-        height=max(380, 38 * len(d) + 150),
         title=dict(
             text=f"Les {len(d)} anomalies les plus graves<br>"
                  f"<sup>{titre}  ·  montants bruts, aucune sommation</sup>",
@@ -393,7 +401,6 @@ def _fig_forest(socle, sub, titre, target, axes, top_n=TOP_N_PANNEAUX):
                    ticktext=d["libelle_rang"].str.slice(0, 40).tolist(),
                    tickfont=dict(size=10)),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=.5),
-        height=max(420, 44 * len(d) + 175),
         title=dict(
             text="Intervalle conforme, prediction et valeur observee<br>"
                  f"<sup>{titre}  ·  valeurs brutes de df, aucune sommation</sup>",
@@ -511,7 +518,7 @@ def _fig_variables(socle, cle_str, target, alpha, n=N_VARS_EXPLIC):
 
 
 # =============================================================================
-# CARTES KPI — html.Div au lieu de HTML(...)
+# CARTES KPI
 # =============================================================================
 def _cartes_dash(sub, titre, score_global):
     if not len(sub):
@@ -519,11 +526,11 @@ def _cartes_dash(sub, titre, score_global):
     part = sub[COL_SCORE].sum() / score_global if len(sub) else 0
     hors = int((~((sub[COL_OBS] >= sub[COL_LO]) & (sub[COL_OBS] <= sub[COL_HI]))).sum())
     cartes = [
-        ("Anomalies",         f"{len(sub):,}".replace(",", " "), "#37474f"),
-        ("Part du score",     f"{100 * part:.1f} %",             "#ad1457"),
-        ("Hors intervalle",   f"{hors:,}".replace(",", " "),     "#00838f"),
-        ("Gravite moyenne",   _fmt4(sub[COL_SCORE].mean()),       "#5e35b1"),
-        ("Pire anomalie",     _fmt4(sub[COL_SCORE].max()),        "#6a1b9a"),
+        ("Anomalies",       f"{len(sub):,}".replace(",", " "), "#37474f"),
+        ("Part du score",   f"{100 * part:.1f} %",             "#ad1457"),
+        ("Hors intervalle", f"{hors:,}".replace(",", " "),     "#00838f"),
+        ("Gravite moyenne", _fmt4(sub[COL_SCORE].mean()),       "#5e35b1"),
+        ("Pire anomalie",   _fmt4(sub[COL_SCORE].max()),        "#6a1b9a"),
     ]
     return html.Div([
         html.Div(titre, style={"fontSize": "15px", "fontWeight": "600",
@@ -546,7 +553,7 @@ def _cartes_dash(sub, titre, score_global):
 
 
 # =============================================================================
-# TABLEAU — dash_table.DataTable au lieu de display(df.style...)
+# TABLEAU
 # =============================================================================
 def _tableau_dash(socle, sub, titre, axes):
     if not len(sub):
@@ -580,12 +587,11 @@ def _tableau_dash(socle, sub, titre, axes):
         ],
         style_cell={"fontSize": "12px", "padding": "6px",
                     "fontFamily": "system-ui,sans-serif"},
-        caption=f"Tableau de priorisation — {titre}",
     )
 
 
 # =============================================================================
-# CHARGEMENT DES DONNEES
+# CHARGEMENT DES DONNEES (depuis Domino — meme chemin que le notebook)
 # =============================================================================
 TARGET  = "Claims_incurred"
 ALPHA   = 0.10
@@ -594,7 +600,6 @@ ID_COLS_CANDIDATS = ["Partner", "Companies", "Lob", "Activity", "Periodicity", "
 base_path     = Path("/domino/datasets/local/conformal_pred_actuariat/DataSet")
 target_folder = base_path / "Dossier_concatenee"
 
-# Chercher le parquet principal (df complet avec toutes les periodes)
 _parquets = sorted(target_folder.glob("*.parquet")) if target_folder.exists() else []
 if _parquets:
     print(f"Chargement : {_parquets[0].name}")
@@ -604,8 +609,7 @@ elif (target_folder / "anomalies_prio.pkl").exists():
     df = pd.read_pickle(target_folder / "anomalies_prio.pkl")
 else:
     raise FileNotFoundError(
-        f"Aucun fichier de donnees trouve dans {target_folder}\n"
-        "Verifier le chemin ou deposer le fichier parquet.")
+        f"Aucun fichier de donnees trouve dans {target_folder}")
 
 df.drop(columns=["annee"], inplace=True, errors="ignore")
 ID_COLS = [c for c in ID_COLS_CANDIDATS if c in df.columns]
@@ -618,17 +622,16 @@ defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk") if c in
 # =============================================================================
 # APPLICATION DASH
 # =============================================================================
-app = Dash(__name__,
-           external_stylesheets=[dbc.themes.BOOTSTRAP],
-           suppress_callback_exceptions=True,
-           title="Dashboard Conformal Prediction")
+app = _DashClass(__name__,
+                 external_stylesheets=[dbc.themes.BOOTSTRAP],
+                 suppress_callback_exceptions=True,
+                 title="Dashboard Conformal Prediction")
 
 _BANDEAU_STYLE = {"fontFamily": "system-ui,sans-serif", "fontSize": "12.5px",
                   "borderRadius": "6px", "padding": "9px 13px", "margin": "14px 0 8px 0"}
 
 app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
 
-    # ── En-tête ───────────────────────────────────────────────────────────
     html.Div([
         html.Span("Tableau de bord — Anomalies conformes",
                   style={"fontWeight": "600", "fontSize": "16px", "color": "#0d47a1"}),
@@ -638,10 +641,8 @@ app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
               "borderRadius": "8px", "marginBottom": "14px",
               "borderLeft": "5px solid #1565C0"}),
 
-    # ── Axes (ToggleButtons → Checklist) ──────────────────────────────────
     html.Div([
-        html.Div("Axes — structurent le cercle et composent les libelles. "
-                 "Ne modifient aucun montant.",
+        html.Div("Axes — structurent le cercle et composent les libelles.",
                  style={**_BANDEAU_STYLE, "background": "#e3f2fd", "color": "#0d47a1"}),
         dcc.Checklist(
             id="axes-check",
@@ -656,10 +657,8 @@ app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
         ),
     ]),
 
-    # ── Cercle ────────────────────────────────────────────────────────────
     dcc.Graph(id="g-cercle", config={"displayModeBar": False}),
 
-    # ── Perimetre ─────────────────────────────────────────────────────────
     html.Div("Perimetre — la maille et la valeur filtrent tout le tableau de bord.",
              style={**_BANDEAU_STYLE, "background": "#e8f5e9", "color": "#1b5e20"}),
     dbc.Row([
@@ -667,7 +666,6 @@ app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
             id="dd-maille",
             options=[{"label": c, "value": c} for c in socle.cles],
             value=defaut_maille, clearable=False,
-            placeholder="Maille…",
         ), md=4),
         dbc.Col(dcc.Dropdown(
             id="dd-valeur",
@@ -677,24 +675,19 @@ app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
         ), md=8),
     ], className="mb-2"),
 
-    # ── Cartes KPI ────────────────────────────────────────────────────────
     html.Div(id="zone-cartes"),
 
-    # ── Barres + Forest ───────────────────────────────────────────────────
     dcc.Graph(id="g-barres"),
     dcc.Graph(id="g-forest"),
 
-    # ── Anomalie en detail ────────────────────────────────────────────────
     html.Div("L'anomalie en detail — evolution et variables explicatives.",
              style={**_BANDEAU_STYLE, "background": "#fff3e0", "color": "#e65100"}),
     dcc.Dropdown(id="dd-unite", options=[], value=None,
-                 placeholder="Anomalie…",
-                 style={"marginBottom": "8px"}),
+                 placeholder="Anomalie…", style={"marginBottom": "8px"}),
     dcc.Graph(id="g-evol"),
     dcc.Graph(id="g-vars"),
 
-    # ── Tableau ───────────────────────────────────────────────────────────
-    html.Div("Tableau de priorisation — perimetre courant.",
+    html.Div("Tableau de priorisation.",
              style={**_BANDEAU_STYLE, "background": "#eceff1", "color": "#37474f"}),
     html.Div(id="zone-tableau"),
 
@@ -706,7 +699,6 @@ app.layout = dbc.Container(fluid=True, style={"padding": "16px"}, children=[
 # CALLBACKS
 # =============================================================================
 
-# 1 — maille change → options valeur
 @app.callback(
     Output("dd-valeur", "options"),
     Output("dd-valeur", "value"),
@@ -716,7 +708,6 @@ def cb_valeur_options(maille):
     return socle.options_valeurs(maille or defaut_maille), VUE_GENERALE
 
 
-# 2 — panneaux principaux (cercle, barres, forest, cartes, unite)
 @app.callback(
     Output("zone-cartes", "children"),
     Output("g-cercle",    "figure"),
@@ -733,7 +724,6 @@ def cb_panneaux(axes, maille, valeur, click_data):
     ctx = callback_context
     triggered = ctx.triggered_id if ctx.triggered_id else "dd-maille"
 
-    # Clic sur le cercle → derive maille + valeur
     if triggered == "g-cercle" and click_data:
         try:
             point_id = click_data["points"][0]["id"]
@@ -753,24 +743,21 @@ def cb_panneaux(axes, maille, valeur, click_data):
     f_barr  = _fig_barres(socle, sub, titre, TARGET, axes_actifs)
     f_for   = _fig_forest(socle, sub, titre, TARGET, axes_actifs)
     options = socle.unites(sub, axes_actifs)
-    valeur_unite = options[0]["value"] if options else None
+    val_u   = options[0]["value"] if options else None
 
-    return cartes, f_cerc, f_barr, f_for, options, valeur_unite
+    return cartes, f_cerc, f_barr, f_for, options, val_u
 
 
-# 3 — detail evolution + variables
 @app.callback(
     Output("g-evol", "figure"),
     Output("g-vars", "figure"),
     Input("dd-unite", "value"),
 )
 def cb_detail(unite):
-    f_evol = _fig_evolution(socle, unite, TARGET, ALPHA)
-    f_vars = _fig_variables(socle, unite, TARGET, ALPHA)
-    return f_evol, f_vars
+    return _fig_evolution(socle, unite, TARGET, ALPHA), \
+           _fig_variables(socle, unite, TARGET, ALPHA)
 
 
-# 4 — tableau de priorisation
 @app.callback(
     Output("zone-tableau", "children"),
     Input("axes-check", "value"),
@@ -785,7 +772,19 @@ def cb_tableau(axes, maille, valeur):
 
 # =============================================================================
 # LANCEMENT
+# Affichage inline dans Jupyter/VSCode sur Domino (comme ipywidgets)
 # =============================================================================
+def lancer(port=8050, height=900):
+    """Appelle cette fonction dans une cellule Jupyter/VSCode pour afficher le dashboard."""
+    if _MODE_JUPYTER:
+        # JupyterDash : affiche directement dans la cellule (mode inline)
+        app.run_server(mode="inline", port=port, height=height)
+    else:
+        # Fallback : ouvre dans le navigateur
+        print(f"Dashboard sur http://localhost:{port}")
+        app.run(debug=False, port=port, host="0.0.0.0")
+
+
+# Appel direct si execute comme script (python tableau_de_bord_dash.py)
 if __name__ == "__main__":
-    print("Dashboard sur : http://localhost:8888")
-    app.run(debug=False, port=8888, host="0.0.0.0")
+    lancer()
