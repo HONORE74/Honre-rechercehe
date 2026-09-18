@@ -133,9 +133,10 @@ def _decode_cle(s):
 
 
 class _Socle:
-    """Trois bases : anomalies_prio (dd, scores), expl (ex, vraies valeurs
-    ligne a ligne), df_model (df, historique complet). table_axes() agrege
-    les vraies valeurs de ex par les axes actifs et y greffe les scores de dd."""
+    """Trois bases : anomalies_prio (dd, scores, filtre a score > 0), expl
+    (ex, vraies valeurs), df_model (df, historique complet). sub_ex est
+    toujours restreint aux cles completes presentes dans sub (les anomalies)
+    -- sinon les lignes saines du meme perimetre se glissent dans les sommes."""
 
     def __init__(self, anomalies_prio, expl, df, id_cols, target, alpha):
         self.df, self.target, self.alpha = df, target, alpha
@@ -153,6 +154,9 @@ class _Socle:
             self.ex[c] = self.ex[c].astype(str)
         if COL_SCORE in self.dd.columns:
             self.dd = self.dd.dropna(subset=[COL_SCORE])
+            #  Seules les vraies anomalies (score strictement positif) --
+            #  jamais les lignes saines du portefeuille.
+            self.dd = self.dd[self.dd[COL_SCORE] > 0]
         self.score_global = float(self.dd[COL_SCORE].sum()) \
             if COL_SCORE in self.dd.columns else 0.0
         self._df_txt = {c: df[c].astype(str).values for c in self.cles}
@@ -161,17 +165,29 @@ class _Socle:
             if c != target and c not in _EXCLURE_VARS
             and pd.api.types.is_numeric_dtype(df[c])]
 
+    def _ex_pour(self, sub):
+        """Restreint expl aux lignes dont la cle complete correspond a une
+        anomalie de sub. Sans ca, table_axes() sommait aussi les vraies
+        valeurs des lignes saines du meme perimetre."""
+        if not len(sub):
+            return self.ex.iloc[0:0]
+        cles_sub = set(map(tuple, sub[self.cles].astype(str).values))
+        m = np.array([tuple(row) in cles_sub
+                     for row in self.ex[self.cles].astype(str).values])
+        return self.ex[m]
+
     def filtrer(self, colonne, valeur):
         if not colonne or colonne not in self.dd.columns:
-            return self.dd, self.ex, "vue generale"
-        if not valeur:
-            return self.dd, self.ex, f"{colonne} — vue generale"
-        m = self.dd[colonne].astype(str) == str(valeur)
-        if not m.any():
-            return self.dd, self.ex, f"{colonne} — vue generale"
-        return (self.dd[m],
-                self.ex[self.ex[colonne].astype(str) == str(valeur)],
-                f"{colonne} = {valeur}")
+            sub, titre = self.dd, "vue generale"
+        elif not valeur:
+            sub, titre = self.dd, f"{colonne} — vue generale"
+        else:
+            m = self.dd[colonne].astype(str) == str(valeur)
+            if not m.any():
+                sub, titre = self.dd, f"{colonne} — vue generale"
+            else:
+                sub, titre = self.dd[m], f"{colonne} = {valeur}"
+        return sub, self._ex_pour(sub), titre
 
     def table_axes(self, sub, sub_ex, axes):
         axes = [a for a in axes if a in sub_ex.columns] or self.cles[:1]
@@ -188,9 +204,6 @@ class _Socle:
             s = (sub.groupby(axes, observed=True)
                     .agg(score=(COL_SCORE, "sum"), score_max=(COL_SCORE, "max"),
                          n=(COL_SCORE, "size")).reset_index())
-            # RECONSTRUIT (capture coupee juste apres le bloc ci-dessus) :
-            # fusion des deux agregats sur les axes, puis defauts a 0 pour les
-            # groupes sans anomalie.
             t = t.merge(s, on=axes, how="left")
             t["score"] = t["score"].fillna(0.0)
             t["score_max"] = t["score_max"].fillna(0.0)
@@ -204,9 +217,6 @@ class _Socle:
         return t
 
     def unites(self, table, axes, n=N_UNITES_LISTE):
-        # RECONSTRUIT (methode non couverte par les captures) : coherent avec
-        # les colonnes de table_axes() et avec l'usage qui en est fait plus
-        # bas (sel_unite.value = un tuple de valeurs, une par axe actif).
         if not len(table):
             return []
         d = table.head(n)
@@ -465,29 +475,34 @@ def _fig_cercle(socle, sub, titre, axes):
     return fig
 
 
-def _cartes(socle, sub, titre, table):
-    part = (sub[COL_SCORE].sum() / max(socle.score_global, 1e-12)
-            if COL_SCORE in sub.columns and len(sub) else 0)
-    grav = _fmt4(sub[COL_SCORE].mean()) if len(sub) else "—"
-    pire = "—"
-    if len(sub) and "rank" in sub.columns:
-        rk = sub.loc[sub[COL_SCORE].idxmax(), "rank"]
-        if pd.notna(rk):
-            pire = f"#{int(rk)}"
-    couv = (f"{100 * table['couvert'].mean():.1f} %" if len(table) else "n/a")
-    cartes = [("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
-              ("Part du score global", f"{100 * part:.1f} %", "#ad1457"),
-              ("Couverture CQR", couv, "#00838f"),
-              ("Gravite moyenne", grav, "#5e35b1"),
-              ("Pire anomalie", pire, "#6a1b9a")]
+def _cartes(socle, sub, sub_ex, titre):
+    pire_rang, obs_pire, interv_pire = None, "—", "—"
+    if len(sub):
+        idx = sub[COL_SCORE].idxmax()
+        pire = sub.loc[idx]
+        if "rank" in sub.columns and pd.notna(pire.get("rank")):
+            pire_rang = int(pire["rank"])
+        m = np.ones(len(sub_ex), dtype=bool)
+        for c in socle.cles:
+            m &= (sub_ex[c].astype(str).values == str(pire[c]))
+        ligne_ex = sub_ex[m]
+        if len(ligne_ex):
+            obs_pire = _fmt(ligne_ex["y_obs"].sum())
+            interv_pire = (f"[{_fmt(ligne_ex['borne_basse'].sum())} ; "
+                           f"{_fmt(ligne_ex['borne_haute'].sum())}]")
+    cartes = [
+        ("Anomalies", f"{len(sub):,}".replace(",", " "), "#37474f"),
+        ("Observe — pire anomalie", f"{obs_pire}  {interv_pire}", "#00838f"),
+        ("Rang", f"#{pire_rang}" if pire_rang else "—", "#6a1b9a"),
+    ]
     blocs = "".join(
-        f"<div style='flex:1;min-width:130px;background:#fff;"
+        f"<div style='flex:1;min-width:170px;background:#fff;"
         f"border:1px solid #e0e0e0;border-left:5px solid {c};"
         f"border-radius:7px;padding:11px 13px;"
         f"box-shadow:0 1px 3px rgba(0,0,0,.07)'>"
         f"<div style='font-size:10.5px;color:#78909c;"
         f"text-transform:uppercase;letter-spacing:.6px'>{t}</div>"
-        f"<div style='font-size:19px;font-weight:600;color:{c};"
+        f"<div style='font-size:17px;font-weight:600;color:{c};"
         f"margin-top:4px'>{v}</div></div>" for t, v, c in cartes)
     return (
         f"<div style='font-family:system-ui,sans-serif;margin:6px 0 14px 0'>"
@@ -650,11 +665,10 @@ def _tableau(table, titre):
         t = pd.DataFrame({
             "Rang": range(1, n + 1),
             "Maille": d["libelle"].values,
-            "Y_obs": [_fmt(v) for v in d["y_obs"]],
-            "Y_pred": [_fmt(v) for v in d["y_pred"]],
-            "CP_bas": [_fmt(v) for v in d["lo"]],
-            "CP_haut": [_fmt(v) for v in d["hi"]],
-            "Couvert": np.where(d["couvert"], "Oui", "Non"),
+            "Observe": [_fmt(v) for v in d["y_obs"]],
+            "Prediction": [_fmt(v) for v in d["y_pred"]],
+            "Borne inferieure": [_fmt(v) for v in d["lo"]],
+            "Borne superieure": [_fmt(v) for v in d["hi"]],
             "Score": [_fmt4(v) for v in d["score"]],
         })
         scores = d["score"].to_numpy(dtype="float64")
@@ -745,8 +759,9 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         store_clic_valeur,
         dcc.Markdown(_bandeau(
             "<b>Axes d'agregation</b> — ils controlent le regroupement des "
-            "vraies valeurs (montants sommes a ce niveau) et le clic sur une "
-            "part du cercle filtre le perimetre.",
+            "vraies valeurs (montants sommes a ce niveau, anomalies "
+            "uniquement) et le clic sur une part du cercle filtre le "
+            "perimetre.",
             fond="#e3f2fd", coul="#0d47a1"), dangerously_allow_html=True),
         html.Div(axes_checklist, style={"marginBottom": "8px"}),
         fig_cercle,
@@ -834,7 +849,7 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
             print(f"Cercle non mis a jour : {type(e).__name__} : {str(e)[:120]}")
             fc = no_update
 
-        cartes = dcc.Markdown(_cartes(socle, sub, titre, table),
+        cartes = dcc.Markdown(_cartes(socle, sub, sub_ex, titre),
                               dangerously_allow_html=True)
         barres = _fig_barres(table, titre, axes, target, top_n)
         forest = _fig_forest(table, titre, axes, target, top_n)
