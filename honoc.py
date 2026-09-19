@@ -1,86 +1,13 @@
-# Remplace :
-y_pred_te = modele.predict(X_te)
-# Par :
-y_pred_te = modele_apres.predict(X_te)
+modele_apres = entrainer(params_finaux, X_tr, y_tr, X_va, y_va)
 
+perf_avant_cv = calculer_perfs_splittings(modele_avant, X_tune, y_tune, n_splits=N_SPLITS_CV)
+perf_apres_cv = calculer_perfs_splittings(modele_apres, X_tune, y_tune, n_splits=N_SPLITS_CV)
+comparaison_cv = perf_avant_cv.merge(perf_apres_cv, on="Split", suffixes=("_avant", "_apres"))
 
+pred_apres = {"Entrainement": predire(modele_apres, X_tr),
+             "Validation": predire(modele_apres, X_va),
+             "Test": predire(modele_apres, X_te)}
+perf_apres_split = pd.DataFrame([metriques(k, vrais[k], pred_apres[k]) for k in vrais])
 
-
-
-
-
-
-# Remplace :
-last_model = modele_final
-# Par :
-last_model = modele_apres
-
-
-
-
-
-
-
-
-
-# Remplace :
-model_lgbm = modele_final
-# Par :
-model_lgbm = modele_apres
-
-
-
-
-
-
-
-
-
-
-
-
-# Remplace :
-last_model = modele_final
-# Par :
-last_model = modele_apres
-
-
-
-
-
-
-
-
-
-
-# Remplace :
-y_true = df_perf["Valeur_Reelle"].values.astype(float)
-y_pred = df_perf["Valeur_Predite"].values.astype(float)
-# Par :
-y_true = df_perf["y_obs"].values.astype(float)
-y_pred = df_perf["y_pred"].values.astype(float)
-
-
-
-
-
-
-
-
-
-
-
-
-# Remplace :
-model=modele_final
-# Par :
-model=modele_apres
-
-
-
-
-
-
-
-
-
+print(comparaison_cv)
+print(perf_apres_split)
