@@ -414,7 +414,7 @@ class _Socle:
                            f"y_obs des graphiques et de la Prioritization "
                            f"Table : {self.source_y_obs}"]
 
-        # --- y_obs_df : vraie valeur de df_model, pour le tableau actuariat ---
+        # --- y_obs_df : vraie valeur de df_model de chaque ligne (carte Coverage) ---
         self.ex["y_obs_df"] = np.nan
         if target in df.columns:
             obs = self._obs_df(self.cles).rename(columns={"y_obs": "_obs_df"})
@@ -423,9 +423,8 @@ class _Socle:
             self.ex["y_obs_df"] = np.where(trouve, res["_obs_df"].to_numpy(),
                                            np.nan)
             self.diagnostic.append(
-                f"y_obs_df (tableau actuariat) : {int(trouve.sum())}/"
-                f"{int(self._m_periode_ex.sum())} lignes d'expl retrouvees "
-                f"dans df_model a la periode {self.libelle_periode()}")
+                f"df_model : {int(trouve.sum())}/{int(self._m_periode_ex.sum())} "
+                f"lignes d'expl retrouvees a la periode {self.libelle_periode()}")
             if trouve.sum() < self._m_periode_ex.sum():
                 exemple = " | ".join(
                     self.ex.loc[self._m_periode_ex & ~trouve, self.cles].iloc[0])
@@ -478,9 +477,8 @@ class _Socle:
 
     def _obs_df(self, axes, filtre=None):
         """Valeur observee de la cible dans df_model, par groupe d'axes, a la
-        periode validee et dans le perimetre. Seule source des montants
-        observes affiches : barres, forest plot, tableau et courbe l'utilisent
-        tous, donc ils ne peuvent pas diverger."""
+        periode validee et dans le perimetre : meme masque que historique(),
+        donc egale au dernier point de la courbe du meme groupe."""
         m = self._m_periode & self._masque_filtre(filtre)
         d = pd.DataFrame({a: self._df_txt[a][m] for a in axes})
         d["y_obs"] = pd.to_numeric(self.df[self.target],
@@ -514,21 +512,16 @@ class _Socle:
 
     def table_axes(self, sub, sub_ex, axes):
         """Une ligne par groupe d'axes, sommee sur les anomalies du groupe
-        (valeurs d'anomalies_prio, comme a l'origine). y_obs_df porte la vraie
-        valeur de df_model de ces memes anomalies : c'est la colonne du tableau
-        actuariat, vide si l'une d'elles manque dans df_model."""
+        (valeurs d'anomalies_prio, comme a l'origine)."""
         axes = [a for a in axes if a in sub_ex.columns] or self.cles[:1]
         if not len(sub_ex):
             return pd.DataFrame(columns=axes + [
-                "y_obs", "y_obs_df", "y_pred", "lo", "hi", COL_SCORE, "n",
+                "y_obs", "y_pred", "lo", "hi", COL_SCORE, "n",
                 "libelle", "couvert"])
-        montants = {"y_obs": ("y_obs", "sum"), "y_obs_df": ("y_obs_df", "sum"),
-                    "n_df": ("y_obs_df", "count"),
-                    "y_pred": ("y_pred", "sum"),
+        montants = {"y_obs": ("y_obs", "sum"), "y_pred": ("y_pred", "sum"),
                     "lo": ("borne_basse", "sum"), "hi": ("borne_haute", "sum"),
                     "n_lignes": ("y_obs", "size")}
         t = sub_ex.groupby(axes, observed=True).agg(**montants).reset_index()
-        t.loc[t["n_df"] < t["n_lignes"], "y_obs_df"] = np.nan
 
         # score_composite repris tel quel de anomalies_prio (aucun cumul) :
         # pour un groupe, celui de son anomalie la plus grave.
@@ -1191,20 +1184,16 @@ def _fig_variable_unique(socle, hist, per, ctx_, var_name):
     return dcc.Graph(figure=fig)
 
 
-def _tableau(table, titre, actuariat=False):
-    """Prioritization Table (valeurs d'anomalies_prio) ou, avec
-    actuariat=True, le meme tableau dont la colonne Observe vient de
-    df_model, pour le controle de l'equipe actuariat."""
+def _tableau(table, titre):
     if not len(table):
         return html.P(f"Aucune anomalie dans le perimetre : {titre}")
     try:
         d = table.head(N_LIGNES_TABLE)
         n = len(d)
-        obs = d["y_obs_df"] if actuariat else d["y_obs"]
         t = pd.DataFrame({
             "Rang": range(1, n + 1),
             "Maille": d["libelle"].values,
-            "Observe": [_fmt(v) for v in obs],
+            "Observe": [_fmt(v) for v in d["y_obs"]],
             "Prediction": [_fmt(v) for v in d["y_pred"]],
             "Borne inferieure": [_fmt(v) for v in d["lo"]],
             "Borne superieure": [_fmt(v) for v in d["hi"]],
@@ -1216,18 +1205,10 @@ def _tableau(table, titre, actuariat=False):
         degrade = [{"if": {"row_index": i},
                     "backgroundColor": f"rgba(198,40,40,{0.12 + 0.55 * (scores[i]-smin)/etendue})"}
                    for i in range(n)]
-        intitule = ("Tableau correspondant à l'équipe actuariat — "
-                    f"{titre}" if actuariat
-                    else f"Prioritization Table — {titre}")
         return html.Div([
-            html.Div(intitule,
+            html.Div(f"Prioritization Table — {titre}",
                      style={"fontWeight": "700", "fontSize": "20px",
-                            "margin": "4px 0 4px 0" if actuariat
-                            else "4px 0 14px 0", "color": _TITRE_PRINC}),
-            html.Div("Valeur observée issue de df_model (vraie donnée), "
-                     "pour que l'équipe puisse vérifier les montants.",
-                     style={"fontSize": "13px", "color": _GRIS,
-                            "margin": "0 0 14px 0"}) if actuariat else None,
+                            "margin": "4px 0 14px 0", "color": _TITRE_PRINC}),
             dash_table.DataTable(
                 data=t.to_dict("records"),
                 columns=[{"name": c, "id": c} for c in t.columns],
@@ -1333,9 +1314,6 @@ def _titre_dashboard(socle):
                                              + socle.libelle_periode("carte")),
                             _pastille_entete(_IC_CIBLE, "Couverture cible "
                                              f"{100 * (1 - socle.alpha):.0f} %"),
-                            _pastille_entete(_IC_LIGNES,
-                                             "Contrôle actuariat : df_model"),
-                            _pastille_entete(_IC_RANG, "Score : anomalies_prio"),
                         ], style={"display": "flex", "flexWrap": "wrap",
                                   "gap": "8px", "marginTop": "18px"}),
                     ]),
@@ -1446,7 +1424,6 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
     fig_vars   = dcc.Graph(id="fig-vars",   figure=_creer_variables())
     cartes_div  = html.Div(id="cartes-div")
     tableau_div = html.Div(id="tableau-div")
-    tableau_actuariat_div = html.Div(id="tableau-actuariat-div")
 
     app.index_string = _GABARIT_HTML
     app.title = f"{target} · Anomaly Detection Dashboard"
@@ -1505,10 +1482,6 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
 
             _bandeau("Prioritization Table"),
             tableau_div,
-
-            _bandeau("Tableau correspondant à l'équipe actuariat",
-                     fond="#e8eaf6", coul="#283593"),
-            tableau_actuariat_div,
         ]
     )
 
@@ -1555,7 +1528,6 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         Output("sel-unite", "options"),
         Output("sel-unite", "value"),
         Output("tableau-div", "children"),
-        Output("tableau-actuariat-div", "children"),
         Input("axes-checklist", "value"),
         Input("sel-valeur", "value"),
         State("sel-maille", "value"),
@@ -1585,10 +1557,8 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
                         else (dispo[0] if dispo else None))
 
         tableau = _tableau(table, titre)
-        tableau_actuariat = _tableau(table, titre, actuariat=True)
 
-        return (fc, cartes, barres, forest, options, unite_valeur, tableau,
-                tableau_actuariat)
+        return fc, cartes, barres, forest, options, unite_valeur, tableau
 
     # --- Reglages propres au graphique a la maille la plus fine ---
     @app.callback(
