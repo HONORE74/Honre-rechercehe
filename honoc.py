@@ -183,14 +183,17 @@ class _Socle:
             if {"year", "quarter"} <= set(df.columns) & set(self.ex.columns):
                 jc = jc + ["year", "quarter"]
             if jc:
-                _obs = (df.copy().assign(**{c: df[c].astype(str) for c in jc})
-                        .groupby(jc, observed=True)[target]
+                _obs = (df.groupby(jc, observed=True)[target]
                         .sum().reset_index()
                         .rename(columns={target: "_obs_vrai"}))
-                self.ex = self.ex.merge(_obs, on=jc, how="left")
-                _m = self.ex["_obs_vrai"].notna()
-                self.ex.loc[_m, "y_obs"] = self.ex.loc[_m, "_obs_vrai"]
-                self.ex.drop(columns=["_obs_vrai"], inplace=True)
+                _g, _d = self.ex.copy(), _obs.copy()
+                for c in jc:                       # cles de jointure en str des deux cotes
+                    _g[c] = _g[c].astype(str)
+                    _d[c] = _d[c].astype(str)
+                _res = _g.merge(_d, on=jc, how="left")
+                self.ex["y_obs"] = np.where(
+                    _res["_obs_vrai"].notna().values,
+                    _res["_obs_vrai"].values, self.ex["y_obs"].values)
 
         # --- y_pred, bornes, dans_intervalle depuis anomalies_prio ---
         for _col in ("y_pred", "borne_basse", "borne_haute", "dans_intervalle"):
@@ -514,9 +517,30 @@ def _fig_cercle(socle, sub, titre, axes):
 # =====================================================================
 #  _cartes  — CORRIGE : retourne les 5 bandeaux KPI
 # =====================================================================
+def _stats_df_model(socle):
+    n_lignes, periode = 0, "—"
+    moyenne = vmin = vmax = None
+    df = socle.df
+    if socle.target in df.columns:
+        col = df[socle.target].dropna()
+        n_lignes = int(len(df))
+        if len(col):
+            moyenne = float(col.mean())
+            vmin = float(col.min())
+            vmax = float(col.max())
+    if {"year", "quarter"} <= set(df.columns):
+        yq = df[["year", "quarter"]].dropna()
+        if len(yq):
+            an = int(yq["year"].max())
+            tr = int(yq[yq["year"] == an]["quarter"].max())
+            periode = f"Q{tr} {an}"
+    return n_lignes, periode, moyenne, vmin, vmax
+
+
 def _cartes(socle, sub, sub_ex, titre):
-    pire_rang, obs_pire, interv_pire = None, "—", "—"
+    pire_rang = None
     couverture_pct = "—"
+    n_lignes, periode, moyenne, vmin, vmax = _stats_df_model(socle)
 
     if len(sub):
         idx = sub[COL_SCORE].idxmax()
@@ -524,18 +548,13 @@ def _cartes(socle, sub, sub_ex, titre):
         if "rank" in sub.columns and pd.notna(pire.get("rank")):
             pire_rang = int(pire["rank"])
 
-        m = np.ones(len(sub_ex), dtype=bool)
-        for c in socle.cles:
-            m &= (sub_ex[c].astype(str).values == str(pire[c]))
-        ligne_ex = sub_ex[m]
-        if len(ligne_ex):
-            obs_pire = _fmt(ligne_ex["y_obs"].sum())
-            interv_pire = (f"[{_fmt(ligne_ex['borne_basse'].sum())} ; "
-                           f"{_fmt(ligne_ex['borne_haute'].sum())}]")
-
         if "dans_intervalle" in sub_ex.columns and len(sub_ex):
             n_couvert = int(sub_ex["dans_intervalle"].sum())
             couverture_pct = f"{100 * n_couvert / len(sub_ex):.1f} %"
+
+    stats_val = (f"Moyenne = {_fmt(moyenne)}"
+                 f"<br><span style='font-size:12px;font-weight:600'>"
+                 f"Min = {_fmt(vmin)} &nbsp;·&nbsp; Max = {_fmt(vmax)}</span>")
 
     cartes = [
         ("Anomalies",
@@ -543,11 +562,19 @@ def _cartes(socle, sub, sub_ex, titre):
          _ACCENT_BLEU,
          "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 "
          "2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"),
-        ("Observation — Worst anomaly",
-         f"{obs_pire}<br><span style='font-size:13px'>{interv_pire}</span>",
+        ("Number of lines — Claims_incurred",
+         f"{n_lignes:,}".replace(",", " "),
          _ACCENT_ROSE,
-         "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 "
-         "2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"),
+         "M3 5h18v2H3V5zm0 6h18v2H3v-2zm0 6h18v2H3v-2z"),
+        ("Periode concernee",
+         periode,
+         _ACCENT_ORANGE,
+         "M19 3h-1V1h-2v2H8V1H6v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 "
+         "0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11z"),
+        ("Statistiques cible",
+         stats_val,
+         _ACCENT_VERT,
+         "M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"),
         ("Rank",
          f"#{pire_rang}" if pire_rang else "—",
          _ACCENT_VIOLET,
@@ -657,26 +684,30 @@ def _fig_forest(table, titre, axes, target, top_n):
     return fig
 
 
-def _fig_evolution(hist, per, ctx_, valeurs, axes, target, alpha):
-    fig = _creer_evolution(target)
+def _remplir_evolution(fig, hist, per, ctx_, valeurs, axes, target, alpha,
+                       conforme):
     if hist is None or not len(hist):
         return _vider(fig, "Aucun historique pour ce sous-portefeuille.")
     val = hist[target].to_numpy(dtype="float64")
     p_valide = ctx_["per"] if ctx_ and ctx_.get("per") in per else per[-1]
     idx_valide = per.index(p_valide) if p_valide in per else len(per) - 1
     obs_vraie = float(val[idx_valide])
-    xb = yb = xp = yp = xh = yh = []
-    if ctx_:
+    xh, yh = [p_valide], [obs_vraie]
+    if conforme and ctx_:
         xb, yb = [p_valide, p_valide], [ctx_["lo"], ctx_["hi"]]
         xp, yp = [p_valide], [ctx_["pred"]]
-        xh, yh = [p_valide], [obs_vraie]
-    couvert = (obs_vraie >= ctx_["lo"] and obs_vraie <= ctx_["hi"]) if ctx_ else True
+        couvert = obs_vraie >= ctx_["lo"] and obs_vraie <= ctx_["hi"]
+    else:
+        xb = yb = xp = yp = []
+        couvert = True
     coul = _OK if couvert else _ACCENT
     halo = "rgba(61,90,158,0.18)" if couvert else "rgba(192,57,43,0.20)"
     fig.data[0].x, fig.data[0].y = per, val
     fig.data[1].x, fig.data[1].y = xb, yb
     fig.data[1].name = f"Intervalle conforme {100 * (1 - alpha):.0f} %"
+    fig.data[1].showlegend = bool(conforme)
     fig.data[2].x, fig.data[2].y = xp, yp
+    fig.data[2].showlegend = bool(conforme)
     fig.data[3].x, fig.data[3].y = per, val
     fig.data[3].text = [_fmt(v) for v in val]
     fig.data[3].hovertemplate = ("<b>%{x}</b><br>" + target
@@ -685,17 +716,43 @@ def _fig_evolution(hist, per, ctx_, valeurs, axes, target, alpha):
     fig.data[4].marker.color = halo
     fig.data[5].x, fig.data[5].y = xh, yh
     fig.data[5].marker.color = coul
-    fig.data[5].name = "Couvert" if couvert else "Hors intervalle"
+    fig.data[5].name = (("Couvert" if couvert else "Hors intervalle")
+                        if conforme else "Valeur observee")
     fig.layout.height = 420
     fig.layout.title = dict(
         text=f"<b style='color:{_ENCRE}'>{' | '.join(valeurs)}</b>"
              f"<br><span style='font-size:11px'>{target} · "
              f"{len(hist)} trimestres · {per[0]} -> {per[-1]} · "
              f"axes {' + '.join(axes)}"
-             + (f" · periode validee <b>{p_valide}</b>" if ctx_ else "")
+             + (f" · periode validee <b>{p_valide}</b>" if (conforme and ctx_)
+                else "")
              + "</span>",
         font=dict(size=14), x=.015, xanchor="left")
     return fig
+
+
+def _fig_evolution(hist, per, ctx_, valeurs, axes, target, alpha):
+    """Graphe 1 : evolution observee seule (sans prediction ni intervalle)."""
+    fig = _creer_evolution(target)
+    return _remplir_evolution(fig, hist, per, ctx_, valeurs, axes, target,
+                              alpha, conforme=False)
+
+
+def _fig_evolution_fine(socle, sub, target, alpha):
+    """Graphe 2 : pire anomalie a la maille la plus fine (cle complete),
+    avec prediction et intervalle conforme. Ne depend que du perimetre
+    (maille/valeur), jamais des axes d'agregation."""
+    fig = _creer_evolution(target)
+    if sub is None or not len(sub):
+        return _vider(fig, "Aucune anomalie a la maille la plus fine.")
+    pire = sub.loc[sub[COL_SCORE].idxmax()]
+    valeurs_fines = [str(pire[c]) for c in socle.cles]
+    hist, per, _ = socle.historique(valeurs_fines, socle.cles)
+    s_ex = socle._ex_pour(sub)
+    table_fine = socle.table_axes(sub, s_ex, socle.cles)
+    ctx_ = socle.contexte(table_fine, valeurs_fines, socle.cles)
+    return _remplir_evolution(fig, hist, per, ctx_, valeurs_fines, socle.cles,
+                              target, alpha, conforme=True)
 
 
 def _fig_variables(socle, hist, per, ctx_):
@@ -904,14 +961,16 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
     sel_var_extra = dcc.Dropdown(
         id="sel-var-extra",
         options=[],
-        value=None, clearable=True,
-        placeholder="Selectionner une variable explicative...",
-        style={"width": "500px", "marginBottom": "10px"})
+        value=None, clearable=True, multi=True,
+        placeholder="Selectionner une ou plusieurs variables explicatives...",
+        style={"width": "700px", "marginBottom": "10px"})
 
     fig_cercle = dcc.Graph(id="fig-cercle", figure=_creer_cercle())
     fig_barres = dcc.Graph(id="fig-barres", figure=_creer_barres())
     fig_forest = dcc.Graph(id="fig-forest", figure=_creer_forest(target))
     fig_evol   = dcc.Graph(id="fig-evol",   figure=_creer_evolution(target))
+    fig_evol_fine = dcc.Graph(id="fig-evol-fine",
+                              figure=_creer_evolution(target))
     fig_vars   = dcc.Graph(id="fig-vars",   figure=_creer_variables())
     cartes_div  = html.Div(id="cartes-div")
     tableau_div = html.Div(id="tableau-div")
@@ -964,6 +1023,15 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
                 fond="#e0f2f1", coul="#004d40"), dangerously_allow_html=True),
             sel_unite,
             html.Div(fig_evol,
+                     style={"background": "#fff", "borderRadius": "10px",
+                            "boxShadow": _OMBRE_CARTE, "padding": "8px",
+                            "marginBottom": "20px"}),
+
+            dcc.Markdown(_bandeau(
+                "<b>Anomalie a la maille la plus fine — prediction et "
+                "intervalle conforme</b>",
+                fond="#ede7f6", coul="#4527a0"), dangerously_allow_html=True),
+            html.Div(fig_evol_fine,
                      style={"background": "#fff", "borderRadius": "10px",
                             "boxShadow": _OMBRE_CARTE, "padding": "8px",
                             "marginBottom": "20px"}),
@@ -1027,6 +1095,7 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         Output("cartes-div", "children"),
         Output("fig-barres", "figure"),
         Output("fig-forest", "figure"),
+        Output("fig-evol-fine", "figure"),
         Output("sel-unite", "options"),
         Output("sel-unite", "value"),
         Output("tableau-div", "children"),
@@ -1052,6 +1121,13 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         barres = _fig_barres(table, titre, axes, target, top_n)
         forest = _fig_forest(table, titre, axes, target, top_n)
 
+        try:
+            evol_fine = _fig_evolution_fine(socle, sub, target, alpha)
+        except Exception as e:
+            print(f"Evol fine non mise a jour : {type(e).__name__} : {str(e)[:120]}")
+            evol_fine = _vider(_creer_evolution(target),
+                               "Anomalie a la maille la plus fine indisponible.")
+
         options = [{"label": lbl, "value": _encode_cle(axes, cle)}
                    for lbl, cle in socle.unites(table, axes)]
         dispo = [o["value"] for o in options]
@@ -1060,7 +1136,8 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
 
         tableau = _tableau(table, titre)
 
-        return fc, cartes, barres, forest, options, unite_valeur, tableau
+        return (fc, cartes, barres, forest, evol_fine,
+                options, unite_valeur, tableau)
 
     @app.callback(
         Output("fig-evol", "figure"),
@@ -1103,15 +1180,19 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         Input("sel-var-extra", "value"),
         State("sel-unite", "value"),
     )
-    def maj_var_extra(var_name, cle_encodee):
-        if not var_name or cle_encodee is None:
+    def maj_var_extra(noms_vars, cle_encodee):
+        if not noms_vars or cle_encodee is None:
             return ""
+        if isinstance(noms_vars, str):
+            noms_vars = [noms_vars]
         hist = etat.get("hist")
         per = etat.get("per")
         ctx_ = etat.get("ctx_")
         if hist is None or per is None:
             return ""
-        return _fig_variable_unique(socle, hist, per, ctx_, var_name)
+        return [html.Div(_fig_variable_unique(socle, hist, per, ctx_, v),
+                         style={"marginBottom": "6px"})
+                for v in noms_vars]
 
 
 # =====================================================================
@@ -1136,4 +1217,3 @@ else:
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=True)
-
