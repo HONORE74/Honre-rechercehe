@@ -362,6 +362,31 @@ def _decode_cle(s):
 
 
 # =====================================================================
+#  Score de priorisation : fonction du notebook, reprise telle quelle
+# =====================================================================
+def calculer_score_priorisation(anomalies_df, gwp_col):
+    df = anomalies_df.copy()
+    if gwp_col not in df.columns:
+        raise KeyError(
+            f"'{gwp_col}' absent de anomalies_df. "
+            f"Ajoute-le dans anomaly_cols avant l'extraction. Colonnes dispo : {list(df.columns)}" )
+    borne_franchie = np.where(df["y_obs"] > df["borne_haute"], df["borne_haute"], df["borne_basse"])
+    df["A_ecart_borne"] = np.abs(df["ecart_intervalle"]) / np.maximum(np.abs(df['largeur_intervalle']), 1e-6)
+    df["B_erreur_modele"] = np.abs(df["y_obs"] - df["y_pred"]) / np.maximum(np.abs(df["y_pred"]), 1e-6)
+
+    # score
+    df["score_prediction"] = df["A_ecart_borne"] * df["B_erreur_modele"]
+    df["score_prediction"] = (df["score_prediction"] - df["score_prediction"].min()) / (df["score_prediction"].max() - df["score_prediction"].min())
+
+    # final score
+    df["score_composite"] = df["score_prediction"] * df[gwp_col]
+
+    df = df.sort_values("score_composite", ascending=False).reset_index(drop=True)
+    df["rank"] = np.arange(1, len(df) + 1)
+    return df
+
+
+# =====================================================================
 #  Classe _Socle  (inchangee)
 # =====================================================================
 class _Socle:
@@ -375,6 +400,20 @@ class _Socle:
                 "Aucune colonne d'identification commune entre anomalies_prio, "
                 f"expl et df. ID_COLS fourni : {list(id_cols)}")
         self.dd = anomalies_prio.copy()
+        # --- score_composite : recalcule ICI avec la fonction du notebook, sur
+        # toutes les anomalies (avant tout filtre), pour que le tableau de bord
+        # affiche exactement les valeurs du notebook ---
+        gwp_col = "avg_dec_" + target
+        requises = ["y_obs", "y_pred", "borne_basse", "borne_haute",
+                    "ecart_intervalle", "largeur_intervalle", gwp_col]
+        absentes = [c for c in requises if c not in self.dd.columns]
+        if absentes:
+            self.info_score = ("score_composite lu tel quel dans anomalies_prio "
+                               f"(colonnes absentes pour le recalcul : {absentes})")
+        else:
+            self.dd = calculer_score_priorisation(self.dd, gwp_col)
+            self.info_score = ("score_composite recalcule avec "
+                               "calculer_score_priorisation (formule du notebook)")
         self.ex = expl.copy()
         for c in self.cles:                  # une seule ecriture des cles partout
             self.dd[c] = _norm_txt(self.dd[c])
@@ -413,7 +452,11 @@ class _Socle:
         self._m_periode_ex = self._masque_periode(self.ex)
         self.diagnostic = [f"periode validee : {self.libelle_periode()}",
                            f"y_obs des graphiques et de la Prioritization "
-                           f"Table : {self.source_y_obs}"]
+                           f"Table : {self.source_y_obs}",
+                           f"{self.info_score} ; plus grand score : "
+                           + (_fmt4(float(self.dd[COL_SCORE].max()))
+                              if len(self.dd) and COL_SCORE in self.dd.columns
+                              else "n/a")]
 
         # --- y_obs_df : vraie valeur de df_model de chaque ligne (carte Coverage) ---
         self.ex["y_obs_df"] = np.nan
