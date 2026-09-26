@@ -1,4 +1,3 @@
-
 import os, sys, json, subprocess
 from pathlib import Path
 from datetime import datetime
@@ -125,11 +124,13 @@ _IC_CIBLE  = ("M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 "
 def _fmt(v):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
-    return f"{v:,.0f}".replace(",", " ")      # espace insecable
+    return f"{v:,.0f}".replace(",", " ")      # espace insecable
 
 def _fmt4(v):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
+    if abs(v) >= 1:      # score_composite en clair, comparable a anomalies_prio
+        return f"{v:,.2f}".replace(",", " ")
     return f"{v:,.4g}".replace(",", " ")
 
 def _session(nom):
@@ -405,6 +406,17 @@ class _Socle:
                 self.ex.loc[_m2, _col] = self.ex.loc[_m2, f"_{_col}_p"]
                 self.ex.drop(columns=[f"_{_col}_p"], inplace=True)
 
+        # --- score_composite : repris tel quel d'anomalies_prio, par la meme
+        # jointure que y_obs et y_pred, puis somme comme eux (jamais de max).
+        # 0 pour un sous-portefeuille sans anomalie.
+        if COL_SCORE in self.dd.columns:
+            _map = (self.dd.groupby(self.cles, observed=True)[COL_SCORE]
+                    .first().reset_index()
+                    .rename(columns={COL_SCORE: f"_{COL_SCORE}_p"}))
+            self.ex = self.ex.merge(_map, on=self.cles, how="left")
+            self.ex[COL_SCORE] = self.ex[f"_{COL_SCORE}_p"].fillna(0.0)
+            self.ex.drop(columns=[f"_{COL_SCORE}_p"], inplace=True)
+
         # Periode validee : celle des predictions (expl), a defaut la plus
         # recente de df_model.
         self.periode = self._periode_validee()
@@ -521,14 +533,15 @@ class _Socle:
         montants = {"y_obs": ("y_obs", "sum"), "y_pred": ("y_pred", "sum"),
                     "lo": ("borne_basse", "sum"), "hi": ("borne_haute", "sum"),
                     "n_lignes": ("y_obs", "size")}
+        # score_composite : meme principe que y_obs et y_pred, valeur
+        # d'anomalies_prio sommee sur les anomalies du groupe (aucun max).
+        if COL_SCORE in sub_ex.columns:
+            montants[COL_SCORE] = (COL_SCORE, "sum")
         t = sub_ex.groupby(axes, observed=True).agg(**montants).reset_index()
 
-        # score_composite repris tel quel de anomalies_prio (aucun cumul) :
-        # pour un groupe, celui de son anomalie la plus grave.
         if len(sub) and COL_SCORE in sub.columns:
             s = (sub.groupby(axes, observed=True)
-                    .agg(**{COL_SCORE: (COL_SCORE, "max"),
-                            "n": (COL_SCORE, "size")}).reset_index())
+                    .agg(n=(COL_SCORE, "size")).reset_index())
             t = t.merge(s, on=axes, how="left")
             t[COL_SCORE] = t[COL_SCORE].fillna(0.0)
             t["n"] = t["n"].fillna(0).astype(int)
@@ -553,16 +566,18 @@ class _Socle:
             return pd.DataFrame(columns=colonnes)
 
         t = (sub.groupby(axes, observed=True)
-                .agg(**{COL_SCORE: (COL_SCORE, "max"),
-                        "n": (COL_SCORE, "size")}).reset_index())
+                .agg(n=(COL_SCORE, "size")).reset_index())
         t = t.merge(self._obs_df(axes, filtre), on=axes, how="left")
 
+        # score_composite somme comme y_pred et les bornes (aucun max)
         ex = self._ex_perimetre(filtre)
         prev = (ex.groupby(axes, observed=True)
                   .agg(y_pred=("y_pred", "sum"), lo=("borne_basse", "sum"),
                        hi=("borne_haute", "sum"),
+                       **{COL_SCORE: (COL_SCORE, "sum")},
                        n_lignes=("y_pred", "size")).reset_index())
         t = t.merge(prev, on=axes, how="left")
+        t[COL_SCORE] = t[COL_SCORE].fillna(0.0)
         t["n_lignes"] = t["n_lignes"].fillna(0).astype(int)
 
         t["couvert"] = (t["y_obs"] >= t["lo"]) & (t["y_obs"] <= t["hi"])
@@ -795,14 +810,14 @@ def _fig_cercle(socle, sub, titre, axes):
     h = socle.hierarchie(sub, axes)
     if not len(h):
         return _vider(fig, "Aucune anomalie a representer.", 300)
-    cmax = float(np.nanpercentile(h["score_moyen"], 95))
+    # score_composite somme sur les anomalies du secteur (ni max, ni moyenne)
+    cmax = float(np.nanpercentile(h["score_total"], 95))
     if not np.isfinite(cmax) or cmax <= 0:
-        cmax = float(h["score_moyen"].max()) or 1.0
+        cmax = float(h["score_total"].max()) or 1.0
     survol = [
         f"<b>{r['label']}</b><br>"
         f"Anomalies : {int(r['n'])}<br>"
-        f"score_composite max : {_fmt4(r['score_max'])}<br>"
-        f"score_composite moyen : {_fmt4(r['score_moyen'])}<br>"
+        f"score_composite : {_fmt4(r['score_total'])}<br>"
         f"Part du perimetre : {r['part']:.1f} %"
         for _, r in h.iterrows()]
     t = fig.data[0]
@@ -816,9 +831,9 @@ def _fig_cercle(socle, sub, titre, axes):
     t.insidetextorientation = "radial"
     t.maxdepth = len(axes)
     t.marker = dict(
-        colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
+        colors=h["score_total"].tolist(), colorscale=ECHELLE,
         cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
-        colorbar=dict(title="score_composite<br>moyen", thickness=16,
+        colorbar=dict(title="score_composite", thickness=16,
                       len=.7, tickformat="~s"))
     fig.layout.height = 620
     fig.layout.title = dict(
@@ -888,7 +903,7 @@ def _carte(libelle, valeur, coul, icone, detail=None, extra=None):
 
 
 def _pct(x):
-    return f"{100 * x:.1f} %".replace(".", ",")
+    return f"{100 * x:.1f} %".replace(".", ",")
 
 
 def _cartes(socle, sub, sub_ex, titre, filtre=None):
