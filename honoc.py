@@ -1,3 +1,4 @@
+
 import os, sys, json, subprocess
 from pathlib import Path
 from datetime import datetime
@@ -28,13 +29,6 @@ app = Dash(__name__,
 # results_v2.drop(columns=["annee"], inplace=True)
 # print(results_v2.shape, df_anomalies.shape)
 # df = results_v2.copy()
-#
-# Base "data" : alimente UNIQUEMENT les cartes "Number of lines" et
-# "Moyenne" (moyenne, minimum, maximum de la cible, valeurs negatives comprises)
-# chemin_data = "/domino/datasets/local/conformal_pred_actuariat/DataSet/Dossier_concatener/data_model_f20.parquet"
-# data = pd.read_parquet(chemin_data)
-# print(f"Number of line : {len(data)}")
-# print(f"Number of variable : {data.shape[1]}")
 
 # =============================================================================
 #  PARAMETRES
@@ -131,7 +125,7 @@ _IC_CIBLE  = ("M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 "
 def _fmt(v):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "n/a"
-    return f"{v:,.0f}".replace(",", " ")      # espace insecable
+    return f"{v:,.0f}".replace(",", " ")      # espace insecable
 
 def _fmt4(v):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
@@ -239,8 +233,7 @@ def _puce(couleur, texte, forme="rond"):
 
 def _tracker(socle, filtre):
     """Une barre par sous-portefeuille du perimetre, dans l'ordre des cles :
-    rouge s'il figure dans anomalies_prio (quel que soit le signe de
-    score_composite), vert sinon."""
+    rouge s'il porte une anomalie (score_composite > 0), vert sinon."""
     ex = socle._ex_perimetre(filtre)
     if not len(ex):
         return None
@@ -299,7 +292,7 @@ def _tracker(socle, filtre):
                         "gap": "8px"}, children=[
             html.Span(f"Ordre : {' › '.join(socle.cles)}"),
             html.Span([_puce(VERT, "Sans anomalie", "carre"),
-                       _puce(ROUGE, "Anomalie", "carre")]
+                       _puce(ROUGE, "Anomalie (score_composite > 0)", "carre")]
                       + ([_puce(AMBRE, "Tranche partiellement anomale", "carre")]
                          if n > max_barres else [])),
         ]),
@@ -386,12 +379,8 @@ class _Socle:
             self.dd[c] = _norm_txt(self.dd[c])
             self.ex[c] = _norm_txt(self.ex[c])
         if COL_SCORE in self.dd.columns:
-            # Aucun filtre de signe : toutes les lignes d'anomalies_prio sont
-            # des anomalies, score_composite negatif compris. Seules les
-            # valeurs manquantes (non classables) sont ecartees.
-            self.dd[COL_SCORE] = pd.to_numeric(self.dd[COL_SCORE],
-                                               errors="coerce")
             self.dd = self.dd.dropna(subset=[COL_SCORE])
+            self.dd = self.dd[self.dd[COL_SCORE] > 0]
         self.score_global = float(self.dd[COL_SCORE].sum()) \
             if COL_SCORE in self.dd.columns else 0.0
         self._df_txt = {c: _norm_txt(df[c]) for c in self.cles}
@@ -541,16 +530,14 @@ class _Socle:
                     .agg(**{COL_SCORE: (COL_SCORE, "max"),
                             "n": (COL_SCORE, "size")}).reset_index())
             t = t.merge(s, on=axes, how="left")
-            # Pas de fillna(0) : un score peut etre negatif, un groupe sans
-            # score passerait devant lui. Il reste vide et se classe en dernier.
+            t[COL_SCORE] = t[COL_SCORE].fillna(0.0)
             t["n"] = t["n"].fillna(0).astype(int)
         else:
             t[COL_SCORE], t["n"] = 0.0, 0
 
         t["couvert"] = (t["y_obs"] >= t["lo"]) & (t["y_obs"] <= t["hi"])
         t["libelle"] = t[axes].astype(str).agg(" | ".join, axis=1).str.slice(0, 38)
-        t = t.sort_values(COL_SCORE, ascending=False,
-                          na_position="last").reset_index(drop=True)
+        t = t.sort_values(COL_SCORE, ascending=False).reset_index(drop=True)
         return t
 
     def table_complete(self, sub, axes, filtre=None):
@@ -661,11 +648,7 @@ class _Socle:
         agg = {"score_total": (COL_SCORE, "sum"),
                "score_moyen": (COL_SCORE, "mean"),
                "score_max": (COL_SCORE, "max"), "n": (COL_SCORE, "size")}
-        # score_composite peut etre negatif, or un secteur du cercle doit
-        # avoir une taille >= 0 (Plotly masque les valeurs negatives) : taille
-        # et part reposent sur le nombre d'anomalies, le score est porte par
-        # la couleur et le survol.
-        total_perimetre = float(len(sub)) or 1.0
+        total_perimetre = float(sub[COL_SCORE].sum()) or 1.0
         lignes = []
         for prof in range(1, prof_max + 1):
             cols = chemin[:prof]
@@ -675,15 +658,14 @@ class _Socle:
                 total = float(r["score_total"])
                 if not np.isfinite(total):
                     continue
-                n = int(r["n"])
                 lignes.append({
                     "id": SEP.join(vals), "label": vals[-1],
                     "parent": SEP.join(vals[:-1]) if prof > 1 else "",
                     "profondeur": prof, "score_total": total,
-                    "valeur_secteur": float(n) if prof == prof_max else 0.0,
+                    "valeur_secteur": total if prof == prof_max else 0.0,
                     "score_moyen": float(r["score_moyen"]),
-                    "score_max": float(r["score_max"]), "n": n,
-                    "part": 100 * n / total_perimetre})
+                    "score_max": float(r["score_max"]), "n": int(r["n"]),
+                    "part": 100 * total / total_perimetre})
         return pd.DataFrame(lignes)
 
 
@@ -813,21 +795,15 @@ def _fig_cercle(socle, sub, titre, axes):
     h = socle.hierarchie(sub, axes)
     if not len(h):
         return _vider(fig, "Aucune anomalie a representer.", 300)
-    # Echelle de couleur couvrant les scores negatifs (5e centile) ; si tous
-    # les scores sont positifs, elle part de 0 comme avant.
-    s = h["score_moyen"].to_numpy(dtype="float64")
-    cmin = min(0.0, float(np.nanpercentile(s, 5)))
-    cmax = float(np.nanpercentile(s, 95))
-    if not np.isfinite(cmax) or cmax <= cmin:
-        cmax = float(np.nanmax(s))
-    if not np.isfinite(cmax) or cmax <= cmin:
-        cmax = cmin + 1.0
+    cmax = float(np.nanpercentile(h["score_moyen"], 95))
+    if not np.isfinite(cmax) or cmax <= 0:
+        cmax = float(h["score_moyen"].max()) or 1.0
     survol = [
         f"<b>{r['label']}</b><br>"
         f"Anomalies : {int(r['n'])}<br>"
         f"score_composite max : {_fmt4(r['score_max'])}<br>"
         f"score_composite moyen : {_fmt4(r['score_moyen'])}<br>"
-        f"Part des anomalies du perimetre : {r['part']:.1f} %"
+        f"Part du perimetre : {r['part']:.1f} %"
         for _, r in h.iterrows()]
     t = fig.data[0]
     t.ids, t.labels = h["id"].tolist(), h["label"].tolist()
@@ -841,7 +817,7 @@ def _fig_cercle(socle, sub, titre, axes):
     t.maxdepth = len(axes)
     t.marker = dict(
         colors=h["score_moyen"].tolist(), colorscale=ECHELLE,
-        cmin=cmin, cmax=cmax, line=dict(color="white", width=1.6),
+        cmin=0, cmax=cmax, line=dict(color="white", width=1.6),
         colorbar=dict(title="score_composite<br>moyen", thickness=16,
                       len=.7, tickformat="~s"))
     fig.layout.height = 620
@@ -855,31 +831,18 @@ def _fig_cercle(socle, sub, titre, axes):
 # =====================================================================
 #  _cartes  — CORRIGE : retourne les 5 bandeaux KPI
 # =====================================================================
-def _stats_data(data, target, cles):
-    """Cartes "Number of lines" et "Moyenne" : calculees sur la base `data`
-    (data_model_f20.parquet), toutes lignes confondues. Aucun filtre de
-    signe : la cible peut etre negative, donc le minimum aussi."""
-    stats = dict(n_lignes=int(len(data)), moyenne=None, vmin=None, vmax=None,
-                 n_sp=None, n_trim=None)
-    if target in data.columns:
-        col = pd.to_numeric(data[target], errors="coerce").astype("float64")
-        col = col[np.isfinite(col.to_numpy())]
+def _stats_df_model(socle):
+    n_lignes = 0
+    moyenne = vmin = vmax = None
+    df = socle.df
+    if socle.target in df.columns:
+        col = df[socle.target].dropna()
+        n_lignes = int(len(df))
         if len(col):
-            stats.update(moyenne=float(col.mean()), vmin=float(col.min()),
-                         vmax=float(col.max()))
-    else:
-        print(f"[controle] data : colonne {target} absente, "
-              "moyenne / min / max non calcules")
-    ids = [c for c in cles if c in data.columns]
-    if ids:
-        stats["n_sp"] = int(data[ids].drop_duplicates().shape[0])
-    if {"year", "quarter"} <= set(data.columns):
-        stats["n_trim"] = int(data[["year", "quarter"]]
-                              .drop_duplicates().shape[0])
-    print(f"[controle] data : {stats['n_lignes']} lignes, "
-          f"moyenne {_fmt(stats['moyenne'])}, min {_fmt(stats['vmin'])}, "
-          f"max {_fmt(stats['vmax'])}")
-    return stats
+            moyenne = float(col.mean())
+            vmin = float(col.min())
+            vmax = float(col.max())
+    return n_lignes, socle.libelle_periode("carte"), moyenne, vmin, vmax
 
 
 def _carte(libelle, valeur, coul, icone, detail=None, extra=None):
@@ -925,11 +888,15 @@ def _carte(libelle, valeur, coul, icone, detail=None, extra=None):
 
 
 def _pct(x):
-    return f"{100 * x:.1f} %".replace(".", ",")
+    return f"{100 * x:.1f} %".replace(".", ",")
 
 
-def _cartes(socle, stats, sub, sub_ex, titre, filtre=None):
-    periode = socle.libelle_periode("carte")
+def _cartes(socle, sub, sub_ex, titre, filtre=None):
+    n_lignes, periode, moyenne, vmin, vmax = _stats_df_model(socle)
+    df = socle.df
+    n_sp_df = int(len(pd.DataFrame(socle._df_txt).drop_duplicates()))
+    n_trim = (int(df[["year", "quarter"]].drop_duplicates().shape[0])
+              if {"year", "quarter"} <= set(df.columns) else None)
 
     # Perimetre : tous les sous-portefeuilles predits a la periode validee
     ex = socle._ex_perimetre(filtre)
@@ -968,16 +935,14 @@ def _cartes(socle, stats, sub, sub_ex, titre, filtre=None):
                f"sur {n_perim} sous-portefeuilles  ·  {_pct(part_anom)}"
                if n_perim else "dans le périmètre courant",
                _barre_progres(part_anom, _ACCENT_ROSE) if n_perim else None),
-        _carte("Number of lines", f"{stats['n_lignes']:,}".replace(",", " "),
+        _carte("Number of lines", f"{n_lignes:,}".replace(",", " "),
                _ACCENT_INDIGO, _IC_LIGNES,
-               (f"{stats['n_sp']} sous-portefeuilles"
-                if stats["n_sp"] is not None else "base data")
-               + (f"  ·  {stats['n_trim']} trimestres"
-                  if stats["n_trim"] else "")),
+               f"{n_sp_df} sous-portefeuilles"
+               + (f"  ·  {n_trim} trimestres" if n_trim else "")),
         _carte("Période concernée", periode,
                _ACCENT_ORANGE, _IC_CAL, "période validée par le modèle"),
-        _carte("Moyenne", _fmt(stats["moyenne"]), _ACCENT_TEAL, _IC_STATS,
-               f"Min {_fmt(stats['vmin'])}  ·  Max {_fmt(stats['vmax'])}"),
+        _carte("Moyenne", _fmt(moyenne), _ACCENT_TEAL, _IC_STATS,
+               f"Min {_fmt(vmin)}  ·  Max {_fmt(vmax)}"),
         _carte("Rank", f"#{pire_rang}" if pire_rang else "—",
                _ACCENT_VIOLET, _IC_RANG, pire_nom),
         _carte("Coverage", _pct(couverture) if np.isfinite(couverture) else "—",
@@ -1234,16 +1199,11 @@ def _tableau(table, titre):
             "Borne superieure": [_fmt(v) for v in d["hi"]],
             COL_SCORE: [_fmt4(v) for v in d[COL_SCORE]],
         })
-        # Degrade relatif au min et au max du tableau : valable pour des
-        # scores negatifs ; un score manquant prend la teinte la plus claire.
         scores = d[COL_SCORE].to_numpy(dtype="float64")
-        finis = scores[np.isfinite(scores)]
-        smin = float(finis.min()) if len(finis) else 0.0
-        smax = float(finis.max()) if len(finis) else 0.0
+        smin, smax = float(scores.min()), float(scores.max())
         etendue = (smax - smin) or 1.0
-        intensite = np.nan_to_num((scores - smin) / etendue, nan=0.0)
         degrade = [{"if": {"row_index": i},
-                    "backgroundColor": f"rgba(198,40,40,{0.12 + 0.55 * intensite[i]})"}
+                    "backgroundColor": f"rgba(198,40,40,{0.12 + 0.55 * (scores[i]-smin)/etendue})"}
                    for i in range(n)]
         return html.Div([
             html.Div(f"Prioritization Table — {titre}",
@@ -1373,15 +1333,9 @@ def _titre_dashboard(socle):
 #  configurer_app
 # =====================================================================
 def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
-                   alpha=.10, top_n=TOP_N_PANNEAUX, data=None):
-    if not isinstance(data, pd.DataFrame):
-        raise ValueError(
-            "la base 'data' (data_model_f20.parquet) doit etre chargee comme "
-            "DataFrame : elle alimente les cartes Number of lines et Moyenne "
-            f"(min / max). Recu : {type(data).__name__}")
+                   alpha=.10, top_n=TOP_N_PANNEAUX):
     socle = _Socle(anomalies_prio, expl, df, id_cols, target, alpha)
     cles = socle.cles
-    stats_data = _stats_data(data, target, cles)
     defaut_maille = next((c for c in ("Lob", "Partner", "Companies", "Risk")
                           if c in cles), cles[0])
 
@@ -1437,7 +1391,6 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
 
     # Reglages propres au graphique a la maille la plus fine : ils ne pilotent
     # que lui. Tous les axes coches par defaut = maille la plus fine.
-    # Tri unique et implicite : score_composite decroissant (pas de selecteur).
     axes_fine = dcc.Checklist(
         id="axes-fine",
         options=[{"label": f" {c} ", "value": c} for c in cles],
@@ -1448,6 +1401,12 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
     sel_unite_fine = dcc.Dropdown(
         id="sel-unite-fine", options=[], value=None, clearable=False,
         style={"width": "720px"})
+    sel_tri_fine = dcc.Dropdown(
+        id="sel-tri-fine", clearable=False, value="score",
+        options=[{"label": "Trier par score_composite", "value": "score"},
+                 {"label": "Trier par écart à l'intervalle", "value": "ecart"},
+                 {"label": "Trier par montant observé", "value": "montant"}],
+        style={"width": "330px"})
 
     sel_var_extra = dcc.Dropdown(
         id="sel-var-extra",
@@ -1511,7 +1470,9 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
                      style={"fontSize": "13px", "color": _GRIS,
                             "margin": "0 0 6px 2px"}),
             html.Div(axes_fine, style={"marginBottom": "8px"}),
-            sel_unite_fine,
+            html.Div([html.Div(sel_unite_fine, style={"display": "inline-block",
+                                                       "marginRight": "47px"}),
+                      html.Div(sel_tri_fine, style={"display": "inline-block"})]),
             html.Div(fig_evol_fine, style=_STYLE_BOITE),
 
             _bandeau("Variables explicatives", fond="#fce4ec", coul="#880e4f"),
@@ -1585,7 +1546,7 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
             print(f"Cercle non mis a jour : {type(e).__name__} : {str(e)[:120]}")
             fc = no_update
 
-        cartes = _cartes(socle, stats_data, sub, sub_ex, titre, filtre)
+        cartes = _cartes(socle, sub, sub_ex, titre, filtre)
         barres = _fig_barres(table, titre, axes, target, top_n)
         forest = _fig_forest(table, titre, axes, target, top_n)
 
@@ -1604,11 +1565,12 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         Output("sel-unite-fine", "options"),
         Output("sel-unite-fine", "value"),
         Input("sel-valeur", "value"),
+        Input("sel-tri-fine", "value"),
         Input("axes-fine", "value"),
         State("sel-maille", "value"),
         State("sel-unite-fine", "value"),
     )
-    def maj_options_fine(valeur, axes_value, maille, ancienne):
+    def maj_options_fine(valeur, tri, axes_value, maille, ancienne):
         axes = _axes_fins(axes_value)
         sub, _, _ = socle.filtrer(maille, valeur)
         if not len(sub):
@@ -1616,8 +1578,16 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
         t = socle.table_complete(sub, axes, socle.perimetre(maille, valeur))
         if not len(t):
             return [], None
-        # Toujours et uniquement trie par score_composite (negatifs compris)
-        t = t.sort_values(COL_SCORE, ascending=False).head(N_UNITES_LISTE)
+        if tri == "montant":
+            t = t.assign(_tri=t["y_obs"])
+        elif tri == "ecart":
+            larg = (t["hi"] - t["lo"]).replace(0, np.nan)
+            depass = np.maximum(t["lo"] - t["y_obs"],
+                                t["y_obs"] - t["hi"]).clip(lower=0)
+            t = t.assign(_tri=(depass / larg).fillna(0.0))
+        else:
+            t = t.assign(_tri=t[COL_SCORE])
+        t = t.sort_values("_tri", ascending=False).head(N_UNITES_LISTE)
         options = []
         for _, r in t.iterrows():
             cle = tuple(str(r[a]) for a in axes)
@@ -1709,7 +1679,7 @@ def configurer_app(app, anomalies_prio, expl, df, id_cols, target,
 # =====================================================================
 #  DEMARRAGE
 # =====================================================================
-_PREREQUIS = ["df_model", "anomalies_prio", "expl", "ID_COLS", "TARGET", "data"]
+_PREREQUIS = ["df_model", "anomalies_prio", "expl", "ID_COLS", "TARGET"]
 _trouve = {n: _session(n) for n in _PREREQUIS}
 _manquants = [n for n, (ok, _) in _trouve.items() if not ok]
 
@@ -1722,7 +1692,7 @@ else:
     try:
         configurer_app(app, _trouve["anomalies_prio"][1], _trouve["expl"][1],
                         _trouve["df_model"][1], id_cols=_trouve["ID_COLS"][1],
-                        target=_trouve["TARGET"][1], data=_trouve["data"][1])
+                        target=_trouve["TARGET"][1])
     except ValueError as _e:
         app.layout = html.Div(f"TABLEAU DE BORD NON AFFICHE : {_e}")
 
